@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+BIN=/opt/autoscribe/services/current/bin/srv-control-ingest
+POLICY=/etc/autoscribe/services.toml
+REPO=$(pwd -P)
+ZERO=0000000000000000000000000000000000000000
+
+while read oldrev newrev refname; do
+    [ "$refname" = "refs/heads/main" ] || continue
+    if [ "$newrev" = "$ZERO" ]; then
+        echo "Refusing deletion of Control main" >&2
+        exit 1
+    fi
+    "$BIN" --policy "$POLICY" --repo "$REPO" --commit "$newrev" --check-only
+
+done

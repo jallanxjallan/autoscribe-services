@@ -1,0 +1,14 @@
+[package]
+name = "srv-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+srv-common = { path = "../../crates/srv-common" }
+tempfile.workspace = true
