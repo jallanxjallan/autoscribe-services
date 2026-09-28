@@ -25,6 +25,12 @@ struct Args {
     check_only: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordKind {
+    Instruction(&'static str),
+    Plan,
+}
+
 #[derive(Debug)]
 struct ControlRecord {
     record_key: String,
@@ -39,6 +45,20 @@ struct ControlRecord {
     source_path: String,
     source_commit: String,
     content_sha256: String,
+}
+
+fn classify_record_path(path: &str) -> Option<RecordKind> {
+    if path.starts_with("roles/") && path.ends_with(".md") {
+        Some(RecordKind::Instruction("role"))
+    } else if path.starts_with("contexts/") && path.ends_with(".md") {
+        Some(RecordKind::Instruction("context"))
+    } else if path.starts_with("tasks/") && path.ends_with(".md") {
+        Some(RecordKind::Instruction("task"))
+    } else if path.starts_with("plans/") && path.ends_with(".json") {
+        Some(RecordKind::Plan)
+    } else {
+        None
+    }
 }
 
 fn parse_frontmatter(text: &str) -> Result<(String, String)> {
@@ -76,7 +96,7 @@ fn validate_instruction_identity(identity: &str, scope: &str) -> Result<()> {
     let prefix = match scope {
         "role" => "rol_",
         "context" => "ctx_",
-        "task" => "spc_",
+        "task" => "tsk_",
         other => bail!("invalid instruction scope: {other}"),
     };
     let suffix = identity
@@ -214,12 +234,7 @@ fn read_blob(repo: &Path, commit: &str, path: &str) -> Result<Vec<u8>> {
     git_output_owned(&args, "git cat-file control record")
 }
 
-fn parse_record(
-    path: &str,
-    bytes: Vec<u8>,
-    commit: &str,
-    max_bytes: usize,
-) -> Result<ControlRecord> {
+fn checked_text(path: &str, bytes: Vec<u8>, max_bytes: usize) -> Result<String> {
     if bytes.len() > max_bytes {
         bail!("control record {path} exceeds {max_bytes} bytes");
     }
@@ -227,6 +242,15 @@ fn parse_record(
     if text.contains('\0') {
         bail!("control record {path} contains NUL bytes");
     }
+    Ok(text)
+}
+
+fn parse_instruction_record(
+    path: &str,
+    text: String,
+    commit: &str,
+    expected_scope: &str,
+) -> Result<ControlRecord> {
     let (yaml_text, body) = parse_frontmatter(&text).with_context(|| path.to_string())?;
     let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
         .with_context(|| format!("invalid YAML frontmatter in {path}"))?;
@@ -238,34 +262,27 @@ fn parse_record(
         .ok_or_else(|| anyhow::anyhow!("frontmatter in {path} must be a mapping"))?;
 
     let record_type = required_string(map, "type")?;
-    let (record_key, identity, slug, scope, title) = match record_type.as_str() {
-        "instruction" => {
-            let (identity, title, scope) =
-                validate_instruction(map, &body).with_context(|| path.to_string())?;
-            (
-                format!("instruction:{identity}"),
-                Some(identity),
-                None,
-                Some(scope),
-                title,
-            )
-        }
-        "plan" => {
-            let slug = required_string(map, "slug")?;
-            validate_plan_slug(&slug).with_context(|| path.to_string())?;
-            let title = required_string(map, "title")?;
-            (format!("plan:{slug}"), None, Some(slug), None, title)
-        }
-        other => bail!("unsupported Control record type in {path}: {other}"),
-    };
+    if record_type != "instruction" {
+        bail!("{path} must contain type: instruction");
+    }
+
+    let (identity, title, scope) =
+        validate_instruction(map, &body).with_context(|| path.to_string())?;
+
+    if scope != expected_scope {
+        bail!(
+            "instruction scope mismatch for {path}: directory requires {expected_scope}, record declares {scope}"
+        );
+    }
 
     let frontmatter_json = String::from_utf8(canonical_json_bytes(&frontmatter)?)?;
+
     Ok(ControlRecord {
-        record_key,
+        record_key: format!("instruction:{identity}"),
         record_type,
-        identity,
-        slug,
-        scope,
+        identity: Some(identity),
+        slug: None,
+        scope: Some(scope),
         title,
         body,
         frontmatter,
@@ -276,6 +293,60 @@ fn parse_record(
     })
 }
 
+fn parse_plan_record(path: &str, text: String, commit: &str) -> Result<ControlRecord> {
+    let plan: Value =
+        serde_json::from_str(&text).with_context(|| format!("invalid JSON plan in {path}"))?;
+
+    reject_reserved_keys(&plan).with_context(|| path.to_string())?;
+
+    let map = plan
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("plan {path} must be a JSON object"))?;
+
+    let slug = required_string(map, "identity")?;
+    validate_plan_slug(&slug).with_context(|| path.to_string())?;
+
+    let title = required_string(map, "title")?;
+
+    map.get("steps")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("plan {path} steps must be an object"))?;
+
+    let frontmatter_json = String::from_utf8(canonical_json_bytes(&plan)?)?;
+
+    Ok(ControlRecord {
+        record_key: format!("plan:{slug}"),
+        record_type: "plan".to_string(),
+        identity: None,
+        slug: Some(slug),
+        scope: None,
+        title,
+        body: String::new(),
+        frontmatter: plan,
+        frontmatter_json,
+        source_path: path.to_string(),
+        source_commit: commit.to_string(),
+        content_sha256: sha256_hex(text.as_bytes()),
+    })
+}
+
+fn parse_record(
+    path: &str,
+    bytes: Vec<u8>,
+    commit: &str,
+    max_bytes: usize,
+    kind: RecordKind,
+) -> Result<ControlRecord> {
+    let text = checked_text(path, bytes, max_bytes)?;
+
+    match kind {
+        RecordKind::Instruction(expected_scope) => {
+            parse_instruction_record(path, text, commit, expected_scope)
+        }
+        RecordKind::Plan => parse_plan_record(path, text, commit),
+    }
+}
+
 fn collect_instruction_refs(value: &Value, refs: &mut Vec<(String, String)>) -> Result<()> {
     match value {
         Value::Object(map) => {
@@ -283,15 +354,16 @@ fn collect_instruction_refs(value: &Value, refs: &mut Vec<(String, String)>) -> 
                 let obj = instructions
                     .as_object()
                     .ok_or_else(|| anyhow::anyhow!("plan instructions must be an object"))?;
-                let expected: HashSet<&str> = ["role", "context", "task"].into_iter().collect();
-                let actual: HashSet<&str> = obj.keys().map(String::as_str).collect();
-                if actual != expected {
-                    bail!("plan instructions require exactly role, context and task arrays");
-                }
-                for scope in ["role", "context", "task"] {
-                    let values = obj[scope].as_array().ok_or_else(|| {
+
+                for (scope, identities) in obj {
+                    if !matches!(scope.as_str(), "role" | "context" | "task") {
+                        bail!("invalid plan instruction scope: {scope}");
+                    }
+
+                    let values = identities.as_array().ok_or_else(|| {
                         anyhow::anyhow!("plan instruction references must be arrays")
                     })?;
+
                     for value in values {
                         let identity = value.as_str().ok_or_else(|| {
                             anyhow::anyhow!("plan instruction identities must be strings")
@@ -301,6 +373,7 @@ fn collect_instruction_refs(value: &Value, refs: &mut Vec<(String, String)>) -> 
                     }
                 }
             }
+
             for (key, child) in map {
                 if key != "instructions" {
                     collect_instruction_refs(child, refs)?;
@@ -314,6 +387,7 @@ fn collect_instruction_refs(value: &Value, refs: &mut Vec<(String, String)>) -> 
         }
         _ => {}
     }
+
     Ok(())
 }
 
@@ -403,17 +477,22 @@ fn main() -> Result<()> {
     let mut source_paths = HashSet::new();
 
     for path in paths {
-        if path == "README.md" || path.starts_with('.') || !path.ends_with(".md") {
+        let Some(kind) = classify_record_path(&path) else {
             continue;
-        }
+        };
         if records.len() >= policy.limits.max_control_records {
             bail!(
                 "control snapshot exceeds {} records",
                 policy.limits.max_control_records
             );
-        }
-        let blob = read_blob(&repo, &commit, &path)?;
-        let record = parse_record(&path, blob, &commit, policy.limits.max_control_file_bytes)?;
+        }        let blob = read_blob(&repo, &commit, &path)?;
+        let record = parse_record(
+            &path,
+            blob,
+            &commit,
+            policy.limits.max_control_file_bytes,
+            kind,
+        )?;
         if !record_keys.insert(record.record_key.clone()) {
             bail!("duplicate Control key: {}", record.record_key);
         }
@@ -474,4 +553,88 @@ fn main() -> Result<()> {
         db_path.display()
     );
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_only_canonical_control_paths() {
+        assert_eq!(
+            classify_record_path("roles/Writer.md"),
+            Some(RecordKind::Instruction("role"))
+        );
+        assert_eq!(
+            classify_record_path("contexts/Project.md"),
+            Some(RecordKind::Instruction("context"))
+        );
+        assert_eq!(
+            classify_record_path("tasks/Proofread.md"),
+            Some(RecordKind::Instruction("task"))
+        );
+        assert_eq!(
+            classify_record_path("plans/plan.example.json"),
+            Some(RecordKind::Plan)
+        );
+
+        assert_eq!(classify_record_path("AGENTS.md"), None);
+        assert_eq!(classify_record_path("Templates/New Task.md"), None);
+        assert_eq!(classify_record_path("plans/plan.example.md"), None);
+    }
+
+    #[test]
+    fn task_identity_uses_tsk_prefix() {
+        validate_instruction_identity("tsk_T3W8N5R7C2M9X6QK", "task").unwrap();
+        assert!(
+            validate_instruction_identity("spc_T3W8N5R7C2M9X6QK", "task").is_err()
+        );
+    }
+
+    #[test]
+    fn parses_live_json_plan_shape_with_optional_empty_channels() {
+        let text = r#"{
+            "identity": "plan.hhp-normalize-and-proofread.8m4q2v",
+            "title": "HHP Normalize and Proofread",
+            "description": "Example",
+            "steps": {
+                "1": {
+                    "engine": "chatgpt",
+                    "instructions": {
+                        "role": ["rol_K7M4Q9V2X6C8B3RN"],
+                        "task": ["tsk_T3W8N5R7C2M9X6QK"]
+                    }
+                }
+            }
+        }"#;
+
+        let record =
+            parse_plan_record("plans/example.json", text.to_string(), "abc123").unwrap();
+
+        assert_eq!(record.record_type, "plan");
+        assert_eq!(
+            record.slug.as_deref(),
+            Some("plan.hhp-normalize-and-proofread.8m4q2v")
+        );
+
+        let mut refs = Vec::new();
+        collect_instruction_refs(&record.frontmatter, &mut refs).unwrap();
+        assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn instruction_directory_must_match_scope() {
+        let text = "---\ntitle: Writer\nidentity: rol_K7M4Q9V2X6C8B3RN\ntype: instruction\nscope: role\ntags: []\n---\nWrite clearly.\n";
+
+        assert!(
+            parse_instruction_record(
+                "tasks/Writer.md",
+                text.to_string(),
+                "abc123",
+                "task"
+            )
+            .is_err()
+        );
+    }
 }
