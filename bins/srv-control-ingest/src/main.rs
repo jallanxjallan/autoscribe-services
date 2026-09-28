@@ -51,7 +51,10 @@ fn parse_frontmatter(text: &str) -> Result<(String, String)> {
     let end = rest
         .find(marker)
         .ok_or_else(|| anyhow::anyhow!("control record frontmatter is not terminated by ---"))?;
-    Ok((rest[..end].to_string(), rest[end + marker.len()..].to_string()))
+    Ok((
+        rest[..end].to_string(),
+        rest[end + marker.len()..].to_string(),
+    ))
 }
 
 fn required_string(map: &serde_json::Map<String, Value>, key: &str) -> Result<String> {
@@ -92,7 +95,9 @@ fn validate_plan_slug(slug: &str) -> Result<()> {
         bail!("invalid plan slug length");
     }
     let mut chars = slug.bytes();
-    let first = chars.next().ok_or_else(|| anyhow::anyhow!("empty plan slug"))?;
+    let first = chars
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty plan slug"))?;
     if !first.is_ascii_alphanumeric() {
         bail!("plan slug must begin with an ASCII letter or digit: {slug}");
     }
@@ -139,7 +144,10 @@ fn reject_legacy_instruction_fields(map: &serde_json::Map<String, Value>) -> Res
     Ok(())
 }
 
-fn validate_instruction(map: &serde_json::Map<String, Value>, body: &str) -> Result<(String, String, String)> {
+fn validate_instruction(
+    map: &serde_json::Map<String, Value>,
+    body: &str,
+) -> Result<(String, String, String)> {
     let identity = required_string(map, "identity")?;
     let title = required_string(map, "title")?;
     let scope = required_string(map, "scope")?;
@@ -167,9 +175,11 @@ fn resolve_commit(repo: &Path, commit: &str) -> Result<String> {
         "rev-parse".to_string(),
         format!("{}^{{commit}}", commit),
     ];
-    Ok(String::from_utf8(git_output_owned(&args, "git rev-parse control commit")?)?
-        .trim()
-        .to_string())
+    Ok(
+        String::from_utf8(git_output_owned(&args, "git rev-parse control commit")?)?
+            .trim()
+            .to_string(),
+    )
 }
 
 fn list_paths(repo: &Path, commit: &str) -> Result<Vec<String>> {
@@ -204,7 +214,12 @@ fn read_blob(repo: &Path, commit: &str, path: &str) -> Result<Vec<u8>> {
     git_output_owned(&args, "git cat-file control record")
 }
 
-fn parse_record(path: &str, bytes: Vec<u8>, commit: &str, max_bytes: usize) -> Result<ControlRecord> {
+fn parse_record(
+    path: &str,
+    bytes: Vec<u8>,
+    commit: &str,
+    max_bytes: usize,
+) -> Result<ControlRecord> {
     if bytes.len() > max_bytes {
         bail!("control record {path} exceeds {max_bytes} bytes");
     }
@@ -225,8 +240,8 @@ fn parse_record(path: &str, bytes: Vec<u8>, commit: &str, max_bytes: usize) -> R
     let record_type = required_string(map, "type")?;
     let (record_key, identity, slug, scope, title) = match record_type.as_str() {
         "instruction" => {
-            let (identity, title, scope) = validate_instruction(map, &body)
-                .with_context(|| path.to_string())?;
+            let (identity, title, scope) =
+                validate_instruction(map, &body).with_context(|| path.to_string())?;
             (
                 format!("instruction:{identity}"),
                 Some(identity),
@@ -239,13 +254,7 @@ fn parse_record(path: &str, bytes: Vec<u8>, commit: &str, max_bytes: usize) -> R
             let slug = required_string(map, "slug")?;
             validate_plan_slug(&slug).with_context(|| path.to_string())?;
             let title = required_string(map, "title")?;
-            (
-                format!("plan:{slug}"),
-                None,
-                Some(slug),
-                None,
-                title,
-            )
+            (format!("plan:{slug}"), None, Some(slug), None, title)
         }
         other => bail!("unsupported Control record type in {path}: {other}"),
     };
@@ -280,9 +289,9 @@ fn collect_instruction_refs(value: &Value, refs: &mut Vec<(String, String)>) -> 
                     bail!("plan instructions require exactly role, context and task arrays");
                 }
                 for scope in ["role", "context", "task"] {
-                    let values = obj[scope]
-                        .as_array()
-                        .ok_or_else(|| anyhow::anyhow!("plan instruction references must be arrays"))?;
+                    let values = obj[scope].as_array().ok_or_else(|| {
+                        anyhow::anyhow!("plan instruction references must be arrays")
+                    })?;
                     for value in values {
                         let identity = value.as_str().ok_or_else(|| {
                             anyhow::anyhow!("plan instruction identities must be strings")
@@ -404,12 +413,7 @@ fn main() -> Result<()> {
             );
         }
         let blob = read_blob(&repo, &commit, &path)?;
-        let record = parse_record(
-            &path,
-            blob,
-            &commit,
-            policy.limits.max_control_file_bytes,
-        )?;
+        let record = parse_record(&path, blob, &commit, policy.limits.max_control_file_bytes)?;
         if !record_keys.insert(record.record_key.clone()) {
             bail!("duplicate Control key: {}", record.record_key);
         }

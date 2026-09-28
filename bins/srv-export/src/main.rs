@@ -4,9 +4,9 @@ use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use srv_common::{
-    canonical_json, existing_receipt, load_policy, open_effects_db, read_effect_key,
-    read_ndjson, record_receipt, safe_identifier, sha256_hex, validate_absolute_target,
-    verify_effect_signature, write_ndjson, EFFECT_SCHEMA,
+    canonical_json, existing_receipt, load_policy, open_effects_db, read_effect_key, read_ndjson,
+    record_receipt, safe_identifier, sha256_hex, validate_absolute_target, verify_effect_signature,
+    write_ndjson, EFFECT_SCHEMA,
 };
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -40,6 +40,7 @@ fn effect_lock(db_path: &Path, effect_key: &str) -> Result<File> {
     fs::create_dir_all(&dir)?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(dir.join(effect_key))?;

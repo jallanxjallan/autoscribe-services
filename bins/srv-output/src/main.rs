@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use srv_common::{
     canonical_json, effect_signature, load_policy, read_effect_key, read_ndjson,
-    reject_reserved_keys, require_object, safe_identifier, sha256_hex,
-    validate_absolute_target, validate_branch_name, validate_relative_path, write_ndjson,
-    EFFECT_SCHEMA, RESPONSE_SCHEMA,
+    reject_reserved_keys, require_object, safe_identifier, sha256_hex, validate_absolute_target,
+    validate_branch_name, validate_relative_path, write_ndjson, EFFECT_SCHEMA, RESPONSE_SCHEMA,
 };
 use std::path::PathBuf;
 
@@ -75,8 +74,11 @@ fn main() -> Result<()> {
             bail!("unsupported response schema: {}", response.schema);
         }
         safe_identifier(&response.call_id, "call_id", 160)?;
-        if response.content.as_bytes().len() > policy.limits.max_body_bytes {
-            bail!("response content exceeds {} bytes", policy.limits.max_body_bytes);
+        if response.content.len() > policy.limits.max_body_bytes {
+            bail!(
+                "response content exceeds {} bytes",
+                policy.limits.max_body_bytes
+            );
         }
         require_object(&response.baggage, "baggage")?;
         reject_reserved_keys(&response.baggage)?;
@@ -91,7 +93,11 @@ fn main() -> Result<()> {
             bail!("baggage.outputs may not be empty");
         }
         if outputs.len() > policy.limits.max_outputs {
-            bail!("too many outputs: {} > {}", outputs.len(), policy.limits.max_outputs);
+            bail!(
+                "too many outputs: {} > {}",
+                outputs.len(),
+                policy.limits.max_outputs
+            );
         }
 
         let content_sha256 = sha256_hex(response.content.as_bytes());

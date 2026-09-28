@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use srv_common::{
     canonical_json_bytes, git_output_owned, load_policy, read_ndjson, reject_reserved_keys,
-    require_object, safe_identifier, sha256_hex, validate_absolute_target,
-    validate_relative_path, write_ndjson, INPUT_SCHEMA,
+    require_object, safe_identifier, sha256_hex, validate_absolute_target, validate_relative_path,
+    write_ndjson, INPUT_SCHEMA,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,7 +31,9 @@ struct InputRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum InputSource {
-    File { path: PathBuf },
+    File {
+        path: PathBuf,
+    },
     Git {
         repo: PathBuf,
         commit: String,
@@ -54,7 +56,12 @@ fn empty_object() -> Value {
     Value::Object(Default::default())
 }
 
-fn read_git_blob(repo: &Path, commit: &str, path: &Path, repo_roots: &[PathBuf]) -> Result<(Vec<u8>, String)> {
+fn read_git_blob(
+    repo: &Path,
+    commit: &str,
+    path: &Path,
+    repo_roots: &[PathBuf],
+) -> Result<(Vec<u8>, String)> {
     let repo = validate_absolute_target(repo, repo_roots)?;
     if !repo.is_dir() {
         bail!("Git source is not a directory: {}", repo.display());
@@ -109,14 +116,18 @@ fn main() -> Result<()> {
                 (bytes, json!({"kind":"file","path":path}))
             }
             InputSource::Git { repo, commit, path } => {
-                let (bytes, resolved) = read_git_blob(repo, commit, path, &policy.paths.repo_roots)?;
+                let (bytes, resolved) =
+                    read_git_blob(repo, commit, path, &policy.paths.repo_roots)?;
                 let repo = validate_absolute_target(repo, &policy.paths.repo_roots)?;
-                (bytes, json!({
-                    "kind":"git",
-                    "repo":repo,
-                    "commit":resolved,
-                    "path":path,
-                }))
+                (
+                    bytes,
+                    json!({
+                        "kind":"git",
+                        "repo":repo,
+                        "commit":resolved,
+                        "path":path,
+                    }),
+                )
             }
         };
 

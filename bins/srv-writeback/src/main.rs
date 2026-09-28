@@ -4,10 +4,10 @@ use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use srv_common::{
-    canonical_json, existing_receipt, load_policy, open_effects_db, read_effect_key,
-    read_ndjson, record_receipt, run_checked, safe_identifier, sha256_hex,
-    validate_absolute_target, validate_branch_name, validate_relative_path,
-    verify_effect_signature, write_ndjson, EFFECT_SCHEMA,
+    canonical_json, existing_receipt, load_policy, open_effects_db, read_effect_key, read_ndjson,
+    record_receipt, run_checked, safe_identifier, sha256_hex, validate_absolute_target,
+    validate_branch_name, validate_relative_path, verify_effect_signature, write_ndjson,
+    EFFECT_SCHEMA,
 };
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -41,6 +41,7 @@ fn effect_lock(db_path: &Path, effect_key: &str) -> Result<File> {
     fs::create_dir_all(&dir)?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(dir.join(effect_key))?;
@@ -104,7 +105,10 @@ fn ensure_bare_repo(repo: &Path, branch: &str, create_repo: bool) -> Result<()> 
         "git rev-parse --is-bare-repository",
     )?;
     if value != "true" {
-        bail!("writeback target must be a bare Git repository: {}", repo.display());
+        bail!(
+            "writeback target must be a bare Git repository: {}",
+            repo.display()
+        );
     }
     Ok(())
 }
@@ -131,6 +135,7 @@ fn prior_commit(repo: &Path, effect_key: &str) -> Result<Option<String>> {
 fn repo_lock(repo: &Path) -> Result<File> {
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(repo.join("autoscribe-write.lock"))?;

@@ -158,8 +158,8 @@ pub fn read_effect_key(path: &Path) -> Result<Vec<u8>> {
         );
     }
 
-    let raw = fs::read(path)
-        .with_context(|| format!("failed to read effect key {}", path.display()))?;
+    let raw =
+        fs::read(path).with_context(|| format!("failed to read effect key {}", path.display()))?;
     let trimmed = trim_ascii_whitespace(&raw);
     if trimmed.len() == 64 && trimmed.iter().all(|b| b.is_ascii_hexdigit()) {
         let decoded = hex::decode(trimmed).context("effect key contains invalid hex")?;
@@ -407,11 +407,17 @@ pub fn validate_absolute_target(path: &Path, roots: &[PathBuf]) -> Result<PathBu
     if normalized.exists() {
         let meta = fs::symlink_metadata(&normalized)?;
         if meta.file_type().is_symlink() {
-            bail!("final target may not be a symlink: {}", normalized.display());
+            bail!(
+                "final target may not be a symlink: {}",
+                normalized.display()
+            );
         }
         let real = fs::canonicalize(&normalized)?;
         if !real.starts_with(&root_real) {
-            bail!("target resolves outside configured root: {}", normalized.display());
+            bail!(
+                "target resolves outside configured root: {}",
+                normalized.display()
+            );
         }
     }
 
@@ -547,7 +553,10 @@ mod tests {
         let secret = b"01234567890123456789012345678901";
         let a: Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
         let b: Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
-        assert_eq!(effect_signature(secret, &a).unwrap(), effect_signature(secret, &b).unwrap());
+        assert_eq!(
+            effect_signature(secret, &a).unwrap(),
+            effect_signature(secret, &b).unwrap()
+        );
     }
 
     #[test]
