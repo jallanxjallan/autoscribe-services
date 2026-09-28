@@ -127,59 +127,6 @@ fn validate_plan_slug(slug: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_tags(map: &serde_json::Map<String, Value>) -> Result<()> {
-    let tags = map
-        .get("tags")
-        .ok_or_else(|| anyhow::anyhow!("instruction frontmatter.tags is required"))?
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("instruction frontmatter.tags must be an array"))?;
-    for tag in tags {
-        let tag = tag
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("instruction tags must be strings"))?;
-        if tag.len() > 100 || tag.chars().any(char::is_control) {
-            bail!("invalid instruction tag");
-        }
-    }
-    Ok(())
-}
-
-fn reject_legacy_instruction_fields(map: &serde_json::Map<String, Value>) -> Result<()> {
-    const LEGACY: &[&str] = &[
-        "slug",
-        "component",
-        "kind",
-        "record",
-        "label",
-        "version",
-        "operation",
-        "role",
-        "context",
-    ];
-    for key in LEGACY {
-        if map.contains_key(*key) {
-            bail!("legacy instruction frontmatter field is not canonical: {key}");
-        }
-    }
-    Ok(())
-}
-
-fn validate_instruction(
-    map: &serde_json::Map<String, Value>,
-    body: &str,
-) -> Result<(String, String, String)> {
-    let identity = required_string(map, "identity")?;
-    let title = required_string(map, "title")?;
-    let scope = required_string(map, "scope")?;
-    validate_instruction_identity(&identity, &scope)?;
-    validate_tags(map)?;
-    reject_legacy_instruction_fields(map)?;
-    if body.trim().is_empty() {
-        bail!("instruction body may not be empty");
-    }
-    Ok((identity, title, scope))
-}
-
 fn resolve_commit(repo: &Path, commit: &str) -> Result<String> {
     if commit.is_empty()
         || commit.len() > 128
@@ -252,37 +199,54 @@ fn parse_instruction_record(
     expected_scope: &str,
 ) -> Result<ControlRecord> {
     let (yaml_text, body) = parse_frontmatter(&text).with_context(|| path.to_string())?;
+
     let yaml: serde_yaml::Value = serde_yaml::from_str(&yaml_text)
         .with_context(|| format!("invalid YAML frontmatter in {path}"))?;
-    let frontmatter = serde_json::to_value(yaml)
+
+    let authored = serde_json::to_value(yaml)
         .with_context(|| format!("frontmatter in {path} is not JSON-compatible"))?;
-    reject_reserved_keys(&frontmatter).with_context(|| path.to_string())?;
-    let map = frontmatter
+
+    let authored_map = authored
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("frontmatter in {path} must be a mapping"))?;
 
-    let record_type = required_string(map, "type")?;
-    if record_type != "instruction" {
-        bail!("{path} must contain type: instruction");
+    // The only authored frontmatter field with runtime meaning.
+    let identity = required_string(authored_map, "identity").with_context(|| path.to_string())?;
+
+    // Identity prefix must agree with the directory-derived scope.
+    validate_instruction_identity(&identity, expected_scope).with_context(|| path.to_string())?;
+
+    if body.trim().is_empty() {
+        bail!("instruction body may not be empty: {path}");
     }
 
-    let (identity, title, scope) =
-        validate_instruction(map, &body).with_context(|| path.to_string())?;
+    // Filesystem structure is authoritative for runtime metadata.
+    let title = Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("cannot derive title from {path}"))?
+        .to_string();
 
-    if scope != expected_scope {
-        bail!(
-            "instruction scope mismatch for {path}: directory requires {expected_scope}, record declares {scope}"
-        );
-    }
+    // Build a closed runtime representation. All other authored
+    // frontmatter is deliberately ignored.
+    let mut runtime_map = serde_json::Map::new();
+    runtime_map.insert("identity".to_string(), Value::String(identity.clone()));
+    runtime_map.insert("type".to_string(), Value::String("instruction".to_string()));
+    runtime_map.insert(
+        "scope".to_string(),
+        Value::String(expected_scope.to_string()),
+    );
+    runtime_map.insert("title".to_string(), Value::String(title.clone()));
 
+    let frontmatter = Value::Object(runtime_map);
     let frontmatter_json = String::from_utf8(canonical_json_bytes(&frontmatter)?)?;
 
     Ok(ControlRecord {
         record_key: format!("instruction:{identity}"),
-        record_type,
+        record_type: "instruction".to_string(),
         identity: Some(identity),
         slug: None,
-        scope: Some(scope),
+        scope: Some(expected_scope.to_string()),
         title,
         body,
         frontmatter,
@@ -348,44 +312,48 @@ fn parse_record(
 }
 
 fn collect_instruction_refs(value: &Value, refs: &mut Vec<(String, String)>) -> Result<()> {
-    match value {
-        Value::Object(map) => {
-            if let Some(instructions) = map.get("instructions") {
-                let obj = instructions
-                    .as_object()
-                    .ok_or_else(|| anyhow::anyhow!("plan instructions must be an object"))?;
+    let plan = value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("plan must be an object"))?;
 
-                for (scope, identities) in obj {
-                    if !matches!(scope.as_str(), "role" | "context" | "task") {
-                        bail!("invalid plan instruction scope: {scope}");
-                    }
+    let steps = plan
+        .get("steps")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("plan steps must be an object"))?;
 
-                    let values = identities.as_array().ok_or_else(|| {
-                        anyhow::anyhow!("plan instruction references must be arrays")
-                    })?;
+    for (step_number, step_value) in steps {
+        let step = step_value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("plan step {step_number} must be an object"))?;
 
-                    for value in values {
-                        let identity = value.as_str().ok_or_else(|| {
-                            anyhow::anyhow!("plan instruction identities must be strings")
-                        })?;
-                        validate_instruction_identity(identity, scope)?;
-                        refs.push((scope.to_string(), identity.to_string()));
-                    }
-                }
+        let Some(instructions) = step.get("instructions") else {
+            continue;
+        };
+
+        let obj = instructions.as_object().ok_or_else(|| {
+            anyhow::anyhow!("plan step {step_number} instructions must be an object")
+        })?;
+
+        for (scope, identities) in obj {
+            if !matches!(scope.as_str(), "role" | "context" | "task") {
+                bail!("invalid instruction scope {scope} in plan step {step_number}");
             }
 
-            for (key, child) in map {
-                if key != "instructions" {
-                    collect_instruction_refs(child, refs)?;
-                }
+            let values = identities.as_array().ok_or_else(|| {
+                anyhow::anyhow!("plan step {step_number} instruction references must be arrays")
+            })?;
+
+            for value in values {
+                let identity = value.as_str().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "plan step {step_number} instruction identities must be strings"
+                    )
+                })?;
+
+                validate_instruction_identity(identity, scope)?;
+                refs.push((scope.to_string(), identity.to_string()));
             }
         }
-        Value::Array(items) => {
-            for child in items {
-                collect_instruction_refs(child, refs)?;
-            }
-        }
-        _ => {}
     }
 
     Ok(())
@@ -485,7 +453,8 @@ fn main() -> Result<()> {
                 "control snapshot exceeds {} records",
                 policy.limits.max_control_records
             );
-        }        let blob = read_blob(&repo, &commit, &path)?;
+        }
+        let blob = read_blob(&repo, &commit, &path)?;
         let record = parse_record(
             &path,
             blob,
@@ -555,7 +524,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,9 +555,7 @@ mod tests {
     #[test]
     fn task_identity_uses_tsk_prefix() {
         validate_instruction_identity("tsk_T3W8N5R7C2M9X6QK", "task").unwrap();
-        assert!(
-            validate_instruction_identity("spc_T3W8N5R7C2M9X6QK", "task").is_err()
-        );
+        assert!(validate_instruction_identity("spc_T3W8N5R7C2M9X6QK", "task").is_err());
     }
 
     #[test]
@@ -609,8 +575,7 @@ mod tests {
             }
         }"#;
 
-        let record =
-            parse_plan_record("plans/example.json", text.to_string(), "abc123").unwrap();
+        let record = parse_plan_record("plans/example.json", text.to_string(), "abc123").unwrap();
 
         assert_eq!(record.record_type, "plan");
         assert_eq!(
@@ -628,13 +593,8 @@ mod tests {
         let text = "---\ntitle: Writer\nidentity: rol_K7M4Q9V2X6C8B3RN\ntype: instruction\nscope: role\ntags: []\n---\nWrite clearly.\n";
 
         assert!(
-            parse_instruction_record(
-                "tasks/Writer.md",
-                text.to_string(),
-                "abc123",
-                "task"
-            )
-            .is_err()
+            parse_instruction_record("tasks/Writer.md", text.to_string(), "abc123", "task")
+                .is_err()
         );
     }
 }
