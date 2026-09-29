@@ -117,7 +117,7 @@ EOF2
 git -C "$TMP/content-work" add .
 git -C "$TMP/content-work" commit -m $'dispatch smoke\n\nPlan: Smoke Plan pln_SMOKE' >/dev/null
 git -C "$TMP/content-work" remote add origin "$TMP/repos/content.git"
-git -C "$TMP/control-work" push origin main >/dev/null
+git -C "$TMP/content-work" push origin main >/dev/null
 CONTENT_SHA=$(git -C "$TMP/content-work" rev-parse HEAD)
 "$BIN/srv-input" --policy "$POLICY" repo \
   --repo "$TMP/repos/content.git" --commit "$CONTENT_SHA" --branch main \
@@ -160,14 +160,14 @@ COUNT=$(git --git-dir "$TMP/repos/content.git" rev-list --count main)
 [ "$COUNT" = "2" ]
 "$BIN/srv-writeback" --policy "$POLICY" < "$TMP/repo-effect.ndjson" > "$TMP/repo-receipt-2.ndjson"
 cmp "$TMP/repo-receipt.ndjson" "$TMP/repo-receipt-2.ndjson"
-[ "$(git --git-dir "$TMP/reps/content.git" rev-list --count main)" = "2" ]
+[ "$(git --git-dir "$TMP/repos/content.git" rev-list --count main)" = "2" ]
 
 echo '[4/7] Writeback commit does not redispatch because it has no Plan: line'
 WRITEBACK_SHA=$(git --git-dir "$TMP/repos/content.git" rev-parse main)
 "$BIN/srv-input" --policy "$POLICY" repo \
   --repo "$TMP/repos/content.git" --commit "$WRITEBACK_SHA" --branch main \
   > "$TMP/no-loop.ndjson"
-[ ! (s -s "$TMP/no-loop.ndjson") ]
+[ ! -s "$TMP/no-loop.ndjson" ]
 
 echo '[5/7] Tampering with the signed return route is rejected before effect creation'
 python3 - <<PY > "$TMP/tampered-response.ndjson"
