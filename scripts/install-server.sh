@@ -20,6 +20,7 @@ sudo mkdir -p "$RELEASE/bin"
 for bin in "${BINS[@]}"; do
   sudo install -m 0755 "target/release/$bin" "$RELEASE/bin/$bin"
 done
+sudo install -m 0755 scripts/reset-control-db.sh "$RELEASE/bin/reset-control-db"
 sudo ln -sfn "$RELEASE" "$CURRENT.new"
 sudo mv -Tf "$CURRENT.new" "$CURRENT"
 
