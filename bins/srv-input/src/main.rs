@@ -15,7 +15,9 @@ const RETURN_SCHEMA: &str = "autoscribe.return.v1";
 const DROPBOX_INCOMING: &str = "dropbox:biznet/incoming";
 
 #[derive(Parser, Debug)]
-#[command(about = "Normalize trusted repo or direct Dropbox input into canonical AutoScribe NDJSON")]
+#[command(
+    about = "Normalize trusted repo or direct Dropbox input into canonical AutoScribe NDJSON"
+)]
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
     policy: PathBuf,
@@ -350,8 +352,8 @@ fn run_direct(policy: &srv_common::Policy, secret: &[u8], batch: &str, plan: &st
         let path = safe_remote_path(line)?;
         let remote = format!("{batch_root}/{}", path.display());
         let bytes = rclone_output(&["cat", &remote], "rclone cat incoming file")?;
-        let content = String::from_utf8(bytes)
-            .with_context(|| format!("{remote} is not UTF-8 text"))?;
+        let content =
+            String::from_utf8(bytes).with_context(|| format!("{remote} is not UTF-8 text"))?;
         let source = json!({
             "kind": "dropbox",
             "batch": batch,
