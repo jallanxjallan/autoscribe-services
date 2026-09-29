@@ -11,7 +11,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
-#[command(about = "Validate a Control Git snapshot and atomically rebuild the trusted relational control DB")]
+#[command(
+    about = "Validate a Control Git snapshot and atomically rebuild the trusted relational control DB"
+)]
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
     policy: PathBuf,
@@ -40,33 +42,6 @@ struct InstructionRecord {
     source_path: String,
     source_commit: String,
     content_sha256: String,
-}
-
-#[derive(Debug)]
-struct PlanRecord {
-    id: String,
-    label: String,
-    description: String,
-    scope: Option<String>,
-    source_path: String,
-    source_commit: String,
-    content_sha256: String,
-    steps: Vec<StepRecord>,
-}
-
-#[derive(Debug)]
-struct StepRecord {
-    position: i64,
-    label: String,
-    engine_kind: String,
-    engine: String,
-    model: Option<String>,
-    script: Option<String>,
-    rag_profile: Option<String>,
-    temperature: Option<f64>,
-    max_output_tokens: Option<i64>,
-    args_json: String,
-    instructions: Vec<InstructionRef>,
 }
 
 #[derive(Debug)]
@@ -259,16 +234,69 @@ fn parse_instruction_record(
     })
 }
 
-fn parse_instruction_refs(step_number: usize, value: &Value) -> Result<Vec<InstructionRef>> {
+struct ReusableStepRecord {
+    id: String,
+    label: String,
+    engine_kind: String,
+    engine: String,
+    model: Option<String>,
+    script: Option<String>,
+    rag_profile: Option<String>,
+    args_json: String,
+    instructions: Vec<InstructionRef>,
+    source_path: String,
+    source_commit: String,
+    content_sha256: String,
+}
+
+struct PlanStepLink {
+    position: i64,
+    step_id: String,
+}
+
+struct ReusablePlanRecord {
+    id: String,
+    label: String,
+    description: String,
+    scope: Option<String>,
+    source_path: String,
+    source_commit: String,
+    content_sha256: String,
+    steps: Vec<PlanStepLink>,
+}
+
+fn is_reusable_step_path(path: &str) -> bool {
+    let mut parts = path.split('/');
+    matches!(parts.next(), Some("steps"))
+        && matches!(parts.next(), Some(name) if name.ends_with(".json"))
+        && parts.next().is_none()
+}
+
+fn validate_reusable_step_identity(identity: &str) -> Result<()> {
+    const STEP_ID_ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+    let suffix = identity
+        .strip_prefix("stp_")
+        .ok_or_else(|| anyhow::anyhow!("step identity must begin with stp_"))?;
+
+    if suffix.len() != 16
+        || !suffix
+            .chars()
+            .all(|ch| ch.is_ascii() && STEP_ID_ALPHABET.contains(ch))
+    {
+        bail!("step identity must be stp_ followed by 16 uppercase Crockford Base32 characters");
+    }
+    Ok(())
+}
+
+fn parse_instruction_refs(step_id: &str, value: &Value) -> Result<Vec<InstructionRef>> {
     let obj = value
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("plan step {step_number} instructions must be an object"))?;
+        .ok_or_else(|| anyhow::anyhow!("step {step_id} instructions must be an object"))?;
 
     let expected = ["role", "context", "task"];
     if obj.len() != expected.len() || expected.iter().any(|key| !obj.contains_key(*key)) {
-        bail!(
-            "plan step {step_number} instructions must contain exactly role, context and task arrays"
-        );
+        bail!("step {step_id} instructions must contain exactly role, context and task arrays");
     }
 
     let mut refs = Vec::new();
@@ -279,21 +307,17 @@ fn parse_instruction_refs(step_number: usize, value: &Value) -> Result<Vec<Instr
             .get(component)
             .and_then(Value::as_array)
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "plan step {step_number} instruction component {component} must be an array"
-                )
+                anyhow::anyhow!("step {step_id} instruction component {component} must be an array")
             })?;
 
         for (index, value) in values.iter().enumerate() {
             let identity = value.as_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "plan step {step_number} instruction identities must be strings"
-                )
+                anyhow::anyhow!("step {step_id} instruction identities must be strings")
             })?;
             validate_instruction_identity(identity, component)
-                .with_context(|| format!("plan step {step_number}"))?;
+                .with_context(|| format!("step {step_id}"))?;
             if !seen.insert(identity.to_string()) {
-                bail!("plan step {step_number} repeats instruction {identity}");
+                bail!("step {step_id} repeats instruction {identity}");
             }
             refs.push(InstructionRef {
                 component: component.to_string(),
@@ -306,81 +330,48 @@ fn parse_instruction_refs(step_number: usize, value: &Value) -> Result<Vec<Instr
     Ok(refs)
 }
 
-fn optional_f64(
-    map: &serde_json::Map<String, Value>,
-    key: &str,
-    step_number: usize,
-) -> Result<Option<f64>> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => value
-            .as_f64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("plan step {step_number} {key} is not a finite number")),
-        Some(_) => bail!("plan step {step_number} {key} must be a number or null"),
-    }
-}
+fn parse_reusable_step_record(
+    path: &str,
+    text: String,
+    commit: &str,
+) -> Result<ReusableStepRecord> {
+    let step: Value =
+        serde_json::from_str(&text).with_context(|| format!("invalid JSON step in {path}"))?;
+    reject_reserved_keys(&step).with_context(|| path.to_string())?;
 
-fn optional_i64(
-    map: &serde_json::Map<String, Value>,
-    key: &str,
-    step_number: usize,
-) -> Result<Option<i64>> {
-    match map.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Number(value)) => value
-            .as_i64()
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("plan step {step_number} {key} must be an integer")),
-        Some(_) => bail!("plan step {step_number} {key} must be an integer or null"),
-    }
-}
-
-fn parse_step(step_number: usize, value: &Value) -> Result<StepRecord> {
-    let map = value
+    let map = step
         .as_object()
-        .ok_or_else(|| anyhow::anyhow!("plan step {step_number} must be an object"))?;
+        .ok_or_else(|| anyhow::anyhow!("step {path} must be a JSON object"))?;
 
-    let engine =
-        required_string(map, "engine").with_context(|| format!("plan step {step_number}"))?;
-    let engine_kind = required_string(map, "engine_kind")
-        .with_context(|| format!("plan step {step_number}"))?;
+    let id = required_string(map, "identity").with_context(|| path.to_string())?;
+    validate_reusable_step_identity(&id).with_context(|| path.to_string())?;
 
-    let label = match optional_string(map, "label")
-        .with_context(|| format!("plan step {step_number}"))?
-    {
-        Some(value) if !value.trim().is_empty() => value,
-        _ => format!("Step {step_number}"),
-    };
+    let expected_path = format!("steps/{id}.json");
+    if path != expected_path {
+        bail!("step identity/filename mismatch: {path} contains {id}");
+    }
+
+    let label = required_string(map, "label").with_context(|| path.to_string())?;
+    let engine = required_string(map, "engine").with_context(|| format!("step {id}"))?;
+    let engine_kind = required_string(map, "engine_kind").with_context(|| format!("step {id}"))?;
 
     let (model, script, rag_profile) = match engine_kind.as_str() {
         "llm" => (
-            Some(
-                required_string(map, "model")
-                    .with_context(|| format!("plan step {step_number}"))?,
-            ),
+            Some(required_string(map, "model").with_context(|| format!("step {id}"))?),
             None,
             None,
         ),
         "script" => (
             None,
-            Some(
-                required_string(map, "script")
-                    .with_context(|| format!("plan step {step_number}"))?,
-            ),
+            Some(required_string(map, "script").with_context(|| format!("step {id}"))?),
             None,
         ),
         "rag" => (
             None,
             None,
-            Some(
-                required_string(map, "rag_profile")
-                    .with_context(|| format!("plan step {step_number}"))?,
-            ),
+            Some(required_string(map, "rag_profile").with_context(|| format!("step {id}"))?),
         ),
-        other => bail!(
-            "plan step {step_number} engine_kind must be llm, script or rag, not {other}"
-        ),
+        other => bail!("step {id} engine_kind must be llm, script or rag, not {other}"),
     };
 
     for (field, allowed) in [
@@ -389,43 +380,39 @@ fn parse_step(step_number: usize, value: &Value) -> Result<StepRecord> {
         ("rag_profile", engine_kind == "rag"),
     ] {
         if !allowed && map.contains_key(field) {
-            bail!("plan step {step_number} has conflicting field {field}");
+            bail!("step {id} has conflicting field {field}");
         }
     }
 
-    let args = map
-        .get("args")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("plan step {step_number} args must be an object"))?;
-    let args_json = String::from_utf8(canonical_json_bytes(&Value::Object(args.clone()))?)?;
+    let args = match map.get("args") {
+        None | Some(Value::Null) => serde_json::Map::new(),
+        Some(Value::Object(value)) => value.clone(),
+        Some(_) => bail!("step {id} args must be an object when present"),
+    };
+    let args_json = String::from_utf8(canonical_json_bytes(&Value::Object(args))?)?;
 
-    let instructions_value = map
-        .get("instructions")
-        .ok_or_else(|| anyhow::anyhow!("plan step {step_number} instructions are required"))?;
-    let instructions = parse_instruction_refs(step_number, instructions_value)?;
+    let instructions = match map.get("instructions") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => parse_instruction_refs(&id, value)?,
+    };
 
-    let temperature = optional_f64(map, "temperature", step_number)?;
-    let max_output_tokens = optional_i64(map, "max_output_tokens", step_number)?;
-    if matches!(max_output_tokens, Some(value) if value < 0) {
-        bail!("plan step {step_number} max_output_tokens may not be negative");
-    }
-
-    Ok(StepRecord {
-        position: step_number as i64,
+    Ok(ReusableStepRecord {
+        id,
         label,
         engine_kind,
         engine,
         model,
         script,
         rag_profile,
-        temperature,
-        max_output_tokens,
         args_json,
         instructions,
+        source_path: path.to_string(),
+        source_commit: commit.to_string(),
+        content_sha256: sha256_hex(text.as_bytes()),
     })
 }
 
-fn parse_plan_record(path: &str, text: String, commit: &str) -> Result<PlanRecord> {
+fn parse_plan_record(path: &str, text: String, commit: &str) -> Result<ReusablePlanRecord> {
     let plan: Value =
         serde_json::from_str(&text).with_context(|| format!("invalid JSON plan in {path}"))?;
     reject_reserved_keys(&plan).with_context(|| path.to_string())?;
@@ -442,36 +429,31 @@ fn parse_plan_record(path: &str, text: String, commit: &str) -> Result<PlanRecor
         .unwrap_or_default();
     let scope = optional_string(map, "scope").with_context(|| path.to_string())?;
 
-    let steps_map = map
+    let steps_array = map
         .get("steps")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("plan {path} steps must be an object"))?;
-    if steps_map.is_empty() {
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("plan {path} steps must be an array of step identities"))?;
+    if steps_array.is_empty() {
         bail!("plan {path} must include at least one step");
     }
 
-    let mut numbered = Vec::with_capacity(steps_map.len());
-    for (key, value) in steps_map {
-        let position = key
-            .parse::<usize>()
-            .with_context(|| format!("plan {path} step key must be a positive integer: {key}"))?;
-        if position == 0 {
-            bail!("plan {path} step positions start at 1");
-        }
-        numbered.push((position, value));
-    }
-    numbered.sort_by_key(|(position, _)| *position);
-
-    let mut steps = Vec::with_capacity(numbered.len());
-    for (index, (position, value)) in numbered.into_iter().enumerate() {
-        let expected = index + 1;
-        if position != expected {
-            bail!("plan {path} step keys must be contiguous ordinals starting at 1");
-        }
-        steps.push(parse_step(position, value).with_context(|| path.to_string())?);
+    let mut steps = Vec::with_capacity(steps_array.len());
+    for (index, value) in steps_array.iter().enumerate() {
+        let step_id = value.as_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "plan {path} step {} must be a step identity string",
+                index + 1
+            )
+        })?;
+        validate_reusable_step_identity(step_id)
+            .with_context(|| format!("plan {path} step {}", index + 1))?;
+        steps.push(PlanStepLink {
+            position: (index + 1) as i64,
+            step_id: step_id.to_string(),
+        });
     }
 
-    Ok(PlanRecord {
+    Ok(ReusablePlanRecord {
         id,
         label,
         description,
@@ -485,39 +467,51 @@ fn parse_plan_record(path: &str, text: String, commit: &str) -> Result<PlanRecor
 
 fn validate_cross_references(
     instructions: &[InstructionRecord],
-    plans: &[PlanRecord],
+    steps: &[ReusableStepRecord],
+    plans: &[ReusablePlanRecord],
 ) -> Result<()> {
     let instruction_kinds: HashMap<&str, &str> = instructions
         .iter()
         .map(|record| (record.id.as_str(), record.kind.as_str()))
         .collect();
 
-    for plan in plans {
-        for step in &plan.steps {
-            for reference in &step.instructions {
-                let actual = instruction_kinds
-                    .get(reference.instruction_id.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "plan {} step {} references missing instruction {}",
-                            plan.source_path,
-                            step.position,
-                            reference.instruction_id
-                        )
-                    })?;
-                if *actual != reference.component.as_str() {
-                    bail!(
-                        "plan {} step {} references {} as {}, but instruction kind is {}",
-                        plan.source_path,
-                        step.position,
-                        reference.instruction_id,
-                        reference.component,
-                        actual
-                    );
-                }
+    for step in steps {
+        for reference in &step.instructions {
+            let actual = instruction_kinds
+                .get(reference.instruction_id.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "step {} references missing instruction {}",
+                        step.id,
+                        reference.instruction_id
+                    )
+                })?;
+            if *actual != reference.component.as_str() {
+                bail!(
+                    "step {} references {} as {}, but instruction kind is {}",
+                    step.id,
+                    reference.instruction_id,
+                    reference.component,
+                    actual
+                );
             }
         }
     }
+
+    let step_ids: HashSet<&str> = steps.iter().map(|step| step.id.as_str()).collect();
+    for plan in plans {
+        for link in &plan.steps {
+            if !step_ids.contains(link.step_id.as_str()) {
+                bail!(
+                    "plan {} step {} references missing reusable step {}",
+                    plan.source_path,
+                    link.position,
+                    link.step_id
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -534,73 +528,81 @@ fn open_db(path: &Path) -> Result<Connection> {
 
 fn create_schema(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(
-        "DROP TABLE IF EXISTS control_records;
-         DROP TABLE IF EXISTS step_instructions;
-         DROP TABLE IF EXISTS steps;
-         DROP TABLE IF EXISTS plans;
-         DROP TABLE IF EXISTS instructions;
-         DROP TABLE IF EXISTS control_meta;
+        r#"DROP TABLE IF EXISTS control_records;
+           DROP TABLE IF EXISTS plan_steps;
+           DROP TABLE IF EXISTS step_instructions;
+           DROP TABLE IF EXISTS steps;
+           DROP TABLE IF EXISTS plans;
+           DROP TABLE IF EXISTS instructions;
+           DROP TABLE IF EXISTS control_meta;
 
-         CREATE TABLE instructions (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL CHECK (kind IN ('role', 'context', 'task')),
-            label TEXT NOT NULL,
-            body TEXT NOT NULL,
-            source_path TEXT NOT NULL UNIQUE,
-            source_commit TEXT NOT NULL,
-            content_sha256 TEXT NOT NULL
-         );
+           CREATE TABLE instructions (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL CHECK (kind IN ('role', 'context', 'task')),
+              label TEXT NOT NULL,
+              body TEXT NOT NULL,
+              source_path TEXT NOT NULL UNIQUE,
+              source_commit TEXT NOT NULL,
+              content_sha256 TEXT NOT NULL
+           );
 
-         CREATE TABLE plans (
-            id TEXT PRIMARY KEY,
-            label TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            scope TEXT,
-            source_path TEXT NOT NULL UNIQUE,
-            source_commit TEXT NOT NULL,
-            content_sha256 TEXT NOT NULL
-         );
+           CREATE TABLE steps (
+              id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              engine_kind TEXT NOT NULL CHECK (engine_kind IN ('llm', 'script', 'rag')),
+              engine TEXT NOT NULL,
+              model TEXT,
+              script TEXT,
+              rag_profile TEXT,
+              args_json TEXT NOT NULL DEFAULT '{}',
+              source_path TEXT NOT NULL UNIQUE,
+              source_commit TEXT NOT NULL,
+              content_sha256 TEXT NOT NULL,
+              CHECK (
+                  (engine_kind = 'llm' AND model IS NOT NULL AND script IS NULL AND rag_profile IS NULL)
+                  OR
+                  (engine_kind = 'script' AND model IS NULL AND script IS NOT NULL AND rag_profile IS NULL)
+                  OR
+                  (engine_kind = 'rag' AND model IS NULL AND script IS NULL AND rag_profile IS NOT NULL)
+              )
+           );
 
-         CREATE TABLE steps (
-            id INTEGER PRIMARY KEY,
-            plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
-            position INTEGER NOT NULL CHECK (position >= 1),
-            label TEXT NOT NULL,
-            engine_kind TEXT NOT NULL CHECK (engine_kind IN ('llm', 'script', 'rag')),
-            engine TEXT NOT NULL,
-            model TEXT,
-            script TEXT,
-            rag_profile TEXT,
-            temperature REAL,
-            max_output_tokens INTEGER CHECK (max_output_tokens IS NULL OR max_output_tokens >= 0),
-            args_json TEXT NOT NULL DEFAULT '{}',
-            UNIQUE (plan_id, position),
-            CHECK (
-                (engine_kind = 'llm' AND model IS NOT NULL AND script IS NULL AND rag_profile IS NULL)
-                OR
-                (engine_kind = 'script' AND model IS NULL AND script IS NOT NULL AND rag_profile IS NULL)
-                OR
-                (engine_kind = 'rag' AND model IS NULL AND script IS NULL AND rag_profile IS NOT NULL)
-            )
-         );
+           CREATE TABLE step_instructions (
+              step_id TEXT NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
+              instruction_id TEXT NOT NULL REFERENCES instructions(id) ON DELETE RESTRICT,
+              component TEXT NOT NULL CHECK (component IN ('role', 'context', 'task')),
+              position INTEGER NOT NULL CHECK (position >= 1),
+              PRIMARY KEY (step_id, component, position),
+              UNIQUE (step_id, instruction_id)
+           );
 
-         CREATE TABLE step_instructions (
-            step_id INTEGER NOT NULL REFERENCES steps(id) ON DELETE CASCADE,
-            instruction_id TEXT NOT NULL REFERENCES instructions(id) ON DELETE RESTRICT,
-            component TEXT NOT NULL CHECK (component IN ('role', 'context', 'task')),
-            position INTEGER NOT NULL CHECK (position >= 1),
-            PRIMARY KEY (step_id, component, position),
-            UNIQUE (step_id, instruction_id)
-         );
+           CREATE TABLE plans (
+              id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT '',
+              scope TEXT,
+              source_path TEXT NOT NULL UNIQUE,
+              source_commit TEXT NOT NULL,
+              content_sha256 TEXT NOT NULL
+           );
 
-         CREATE TABLE control_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-         );
+           CREATE TABLE plan_steps (
+              plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+              step_id TEXT NOT NULL REFERENCES steps(id) ON DELETE RESTRICT,
+              position INTEGER NOT NULL CHECK (position >= 1),
+              PRIMARY KEY (plan_id, position)
+           );
 
-         CREATE INDEX instructions_kind_idx ON instructions(kind);
-         CREATE INDEX steps_plan_idx ON steps(plan_id, position);
-         CREATE INDEX step_instructions_instruction_idx ON step_instructions(instruction_id);",
+           CREATE TABLE control_meta (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+           );
+
+           CREATE INDEX instructions_kind_idx ON instructions(kind);
+           CREATE INDEX step_instructions_instruction_idx
+              ON step_instructions(instruction_id);
+           CREATE INDEX plan_steps_step_idx ON plan_steps(step_id);
+           CREATE INDEX plan_steps_plan_idx ON plan_steps(plan_id, position);"#,
     )?;
     Ok(())
 }
@@ -608,9 +610,10 @@ fn create_schema(tx: &Transaction<'_>) -> Result<()> {
 fn rebuild_db(
     conn: &mut Connection,
     instructions: &[InstructionRecord],
-    plans: &[PlanRecord],
+    steps: &[ReusableStepRecord],
+    plans: &[ReusablePlanRecord],
     commit: &str,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let tx = conn.transaction()?;
     create_schema(&tx)?;
 
@@ -631,9 +634,45 @@ fn rebuild_db(
         )?;
     }
 
-    let mut step_count = 0usize;
-    let mut link_count = 0usize;
+    let mut instruction_link_count = 0usize;
+    for step in steps {
+        tx.execute(
+            "INSERT INTO steps
+             (id, label, engine_kind, engine, model, script, rag_profile, args_json,
+              source_path, source_commit, content_sha256)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                &step.id,
+                &step.label,
+                &step.engine_kind,
+                &step.engine,
+                step.model.as_deref(),
+                step.script.as_deref(),
+                step.rag_profile.as_deref(),
+                &step.args_json,
+                &step.source_path,
+                &step.source_commit,
+                &step.content_sha256,
+            ],
+        )?;
 
+        for reference in &step.instructions {
+            tx.execute(
+                "INSERT INTO step_instructions
+                 (step_id, instruction_id, component, position)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &step.id,
+                    &reference.instruction_id,
+                    &reference.component,
+                    reference.position,
+                ],
+            )?;
+            instruction_link_count += 1;
+        }
+    }
+
+    let mut plan_step_count = 0usize;
     for plan in plans {
         tx.execute(
             "INSERT INTO plans
@@ -650,53 +689,24 @@ fn rebuild_db(
             ],
         )?;
 
-        for step in &plan.steps {
+        for link in &plan.steps {
             tx.execute(
-                "INSERT INTO steps
-                 (plan_id, position, label, engine_kind, engine, model, script, rag_profile,
-                  temperature, max_output_tokens, args_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    &plan.id,
-                    step.position,
-                    &step.label,
-                    &step.engine_kind,
-                    &step.engine,
-                    step.model.as_deref(),
-                    step.script.as_deref(),
-                    step.rag_profile.as_deref(),
-                    step.temperature,
-                    step.max_output_tokens,
-                    &step.args_json,
-                ],
+                "INSERT INTO plan_steps(plan_id, step_id, position)
+                 VALUES (?1, ?2, ?3)",
+                params![&plan.id, &link.step_id, link.position],
             )?;
-            let step_id = tx.last_insert_rowid();
-            step_count += 1;
-
-            for reference in &step.instructions {
-                tx.execute(
-                    "INSERT INTO step_instructions
-                     (step_id, instruction_id, component, position)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        step_id,
-                        &reference.instruction_id,
-                        &reference.component,
-                        reference.position,
-                    ],
-                )?;
-                link_count += 1;
-            }
+            plan_step_count += 1;
         }
     }
 
     for (key, value) in [
-        ("schema_version", "2".to_string()),
+        ("schema_version", "3".to_string()),
         ("source_commit", commit.to_string()),
         ("instruction_count", instructions.len().to_string()),
+        ("step_count", steps.len().to_string()),
         ("plan_count", plans.len().to_string()),
-        ("step_count", step_count.to_string()),
-        ("step_instruction_count", link_count.to_string()),
+        ("plan_step_count", plan_step_count.to_string()),
+        ("step_instruction_count", instruction_link_count.to_string()),
     ] {
         tx.execute(
             "INSERT INTO control_meta(key, value) VALUES (?1, ?2)",
@@ -705,7 +715,7 @@ fn rebuild_db(
     }
 
     tx.commit()?;
-    Ok((step_count, link_count))
+    Ok((steps.len(), plan_step_count, instruction_link_count))
 }
 
 fn main() -> Result<()> {
@@ -720,15 +730,24 @@ fn main() -> Result<()> {
     let paths = list_paths(&repo, &commit)?;
 
     let mut instructions = Vec::new();
+    let mut steps = Vec::new();
     let mut plans = Vec::new();
     let mut identities = HashSet::new();
     let mut source_paths = HashSet::new();
     let mut source_record_count = 0usize;
 
     for path in paths {
-        let Some(kind) = classify_record_path(&path) else {
-            continue;
+        let is_step = is_reusable_step_path(&path);
+        let kind = if is_step {
+            None
+        } else {
+            classify_record_path(&path)
         };
+
+        if !is_step && kind.is_none() {
+            continue;
+        }
+
         source_record_count += 1;
         if source_record_count > policy.limits.max_control_records {
             bail!(
@@ -744,7 +763,16 @@ fn main() -> Result<()> {
         let blob = read_blob(&repo, &commit, &path)?;
         let text = checked_text(&path, blob, policy.limits.max_control_file_bytes)?;
 
-        match kind {
+        if is_step {
+            let record = parse_reusable_step_record(&path, text, &commit)?;
+            if !identities.insert(record.id.clone()) {
+                bail!("duplicate Control identity: {}", record.id);
+            }
+            steps.push(record);
+            continue;
+        }
+
+        match kind.expect("record kind checked above") {
             RecordKind::Instruction(expected_scope) => {
                 let record = parse_instruction_record(&path, text, &commit, expected_scope)?;
                 if !identities.insert(record.id.clone()) {
@@ -762,22 +790,19 @@ fn main() -> Result<()> {
         }
     }
 
-    validate_cross_references(&instructions, &plans)?;
+    validate_cross_references(&instructions, &steps, &plans)?;
 
-    let step_count: usize = plans.iter().map(|plan| plan.steps.len()).sum();
-    let link_count: usize = plans
-        .iter()
-        .flat_map(|plan| plan.steps.iter())
-        .map(|step| step.instructions.len())
-        .sum();
+    let plan_step_count: usize = plans.iter().map(|plan| plan.steps.len()).sum();
+    let instruction_link_count: usize = steps.iter().map(|step| step.instructions.len()).sum();
 
     if args.check_only {
         println!(
-            "validated {} instructions, {} plans, {} steps and {} step-instruction links at {}",
+            "validated {} instructions, {} reusable steps, {} plans, {} plan-step links and {} step-instruction links at {}",
             instructions.len(),
+            steps.len(),
             plans.len(),
-            step_count,
-            link_count,
+            plan_step_count,
+            instruction_link_count,
             commit
         );
         return Ok(());
@@ -785,15 +810,16 @@ fn main() -> Result<()> {
 
     let db_path = args.db.unwrap_or_else(|| policy.paths.control_db.clone());
     let mut conn = open_db(&db_path)?;
-    let (written_steps, written_links) =
-        rebuild_db(&mut conn, &instructions, &plans, &commit)?;
+    let (written_steps, written_plan_steps, written_instruction_links) =
+        rebuild_db(&mut conn, &instructions, &steps, &plans, &commit)?;
 
     println!(
-        "ingested {} instructions, {} plans, {} steps and {} step-instruction links from {} into {}",
+        "ingested {} instructions, {} reusable steps, {} plans, {} plan-step links and {} step-instruction links from {} into {}",
         instructions.len(),
-        plans.len(),
         written_steps,
-        written_links,
+        plans.len(),
+        written_plan_steps,
+        written_instruction_links,
         commit,
         db_path.display()
     );
