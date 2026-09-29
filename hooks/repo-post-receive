@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+INPUT=/opt/autoscribe/services/current/bin/srv-input
+ASC=/opt/autoscribe/app/bin/asc
+POLICY=/etc/autoscribe/services.toml
+REPO=$(pwd -P)
+ZERO=0000000000000000000000000000000000000000
+
+while read oldrev newrev refname; do
+    case "$refname" in
+        refs/heads/*) branch=${refname#refs/heads/} ;;
+        *) continue ;;
+    esac
+    [ "$newrev" = "$ZERO" ] && continue
+
+    if [ "$oldrev" = "$ZERO" ]; then
+        commits=$(git --git-dir="$REPO" rev-list --reverse "$newrev")
+    else
+        commits=$(git --git-dir="$REPO" rev-list --reverse "$oldrev..$newrev")
+    fi
+
+    for commit in $commits; do
+        "$INPUT" \
+            --policy "$POLICY" \
+            repo \
+            --repo "$REPO" \
+            --commit "$commit" \
+            --branch "$branch" \
+        | "$ASC" enqueue
+    done
+done

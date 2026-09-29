@@ -1,21 +1,24 @@
-# Install as /etc/autoscribe/services.toml and edit the roots for the server.
+# Install as /etc/autoscribe/services.toml.
+# The data pipeline is locked to:
+#   repo post-receive -> same repo/path
+#   dropbox:biznet/incoming/<batch> -> dropbox:biznet/outgoing/<batch>
 
 [paths]
-# Git repositories that srv-input may read and srv-writeback may mutate/create.
+# Bare Git repositories that repo mode may read and write back to.
 repo_roots = ["/home/jeremy/Repos"]
 
-# Non-Git input/output files. Keep this list narrow.
-# Add the exact Dropbox staging root if/when it is mounted on Biznet.
-file_roots = ["/var/lib/autoscribe/files"]
+# Retained in the shared policy schema for compatibility. The locked data
+# modes do not use arbitrary filesystem input/output roots.
+file_roots = []
 
 effect_key_file = "/etc/autoscribe/effect.key"
 effects_db = "/var/lib/autoscribe/effects.sqlite"
-control_db = "/var/lib/autoscribe/control.sqlite"
+control_db = "/home/jeremy/Data/control.sql"
 
 [limits]
 max_record_bytes = 2097152
 max_body_bytes = 1048576
-max_outputs = 16
+max_outputs = 1
 max_control_file_bytes = 262144
 max_control_records = 10000
 

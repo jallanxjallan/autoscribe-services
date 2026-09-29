@@ -3,14 +3,16 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use srv_common::{
-    canonical_json, effect_signature, load_policy, read_effect_key, read_ndjson,
-    reject_reserved_keys, require_object, safe_identifier, sha256_hex, validate_absolute_target,
-    validate_branch_name, validate_relative_path, write_ndjson, EFFECT_SCHEMA, RESPONSE_SCHEMA,
+    canonical_json, effect_signature, load_policy, read_effect_key, read_ndjson, safe_identifier,
+    sha256_hex, validate_absolute_target, validate_branch_name, validate_relative_path,
+    verify_effect_signature, write_ndjson, EFFECT_SCHEMA, RESPONSE_SCHEMA,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const RETURN_SCHEMA: &str = "autoscribe.return.v1";
 
 #[derive(Parser, Debug)]
-#[command(about = "Validate response baggage and emit authenticated trusted effects")]
+#[command(about = "Verify the trusted input return route and emit one authenticated output effect")]
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
     policy: PathBuf,
@@ -24,33 +26,12 @@ struct ResponseRecord {
     baggage: Value,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum OutputDeclaration {
-    Repo {
-        repo: PathBuf,
-        path: PathBuf,
-        #[serde(default)]
-        branch: Option<String>,
-        #[serde(default)]
-        create_repo: bool,
-    },
-    File {
-        path: PathBuf,
-        #[serde(default = "default_file_mode")]
-        mode: FileMode,
-    },
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "snake_case")]
-enum FileMode {
-    Replace,
-    CreateNew,
-}
-
-fn default_file_mode() -> FileMode {
-    FileMode::Replace
+#[derive(Debug, Deserialize)]
+struct ReturnEnvelope {
+    schema: String,
+    record_id: String,
+    route: Value,
+    signature: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +43,82 @@ struct EffectRecord {
     effect: Value,
     content: String,
     content_sha256: String,
+}
+
+fn safe_batch(value: &str) -> Result<()> {
+    safe_identifier(value, "batch", 96)?;
+    if value == "." || value == ".." || value.contains('/') || value.contains(':') {
+        bail!("batch must be a single folder name");
+    }
+    Ok(())
+}
+
+fn safe_dropbox_path(path: &Path) -> Result<()> {
+    validate_relative_path(path)?;
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Dropbox path must be UTF-8"))?;
+    if text.chars().any(char::is_control) || text.contains('\\') {
+        bail!("Dropbox path contains unsafe characters");
+    }
+    Ok(())
+}
+
+fn normalized_effect(route: &Value, policy: &srv_common::Policy) -> Result<Value> {
+    let route = route
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("return route must be an object"))?;
+    match route.get("kind").and_then(Value::as_str) {
+        Some("repo") => {
+            let repo = PathBuf::from(
+                route
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("repo route missing repo"))?,
+            );
+            let path = PathBuf::from(
+                route
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("repo route missing path"))?,
+            );
+            let branch = route
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("repo route missing branch"))?;
+            let repo = validate_absolute_target(&repo, &policy.paths.repo_roots)?;
+            validate_relative_path(&path)?;
+            validate_branch_name(branch)?;
+            Ok(json!({
+                "kind": "repo",
+                "repo": repo,
+                "path": path,
+                "branch": branch,
+                "create_repo": false,
+            }))
+        }
+        Some("dropbox") => {
+            let batch = route
+                .get("batch")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("Dropbox route missing batch"))?;
+            safe_batch(batch)?;
+            let path = PathBuf::from(
+                route
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Dropbox route missing path"))?,
+            );
+            safe_dropbox_path(&path)?;
+            Ok(json!({
+                "kind": "dropbox",
+                "batch": batch,
+                "path": path,
+            }))
+        }
+        Some(other) => bail!("unsupported trusted return route kind: {other}"),
+        None => bail!("return route missing kind"),
+    }
 }
 
 fn main() -> Result<()> {
@@ -80,81 +137,56 @@ fn main() -> Result<()> {
                 policy.limits.max_body_bytes
             );
         }
-        require_object(&response.baggage, "baggage")?;
-        reject_reserved_keys(&response.baggage)?;
-
-        let outputs = response
+        let baggage = response
             .baggage
-            .get("outputs")
-            .ok_or_else(|| anyhow::anyhow!("response baggage must contain outputs"))?
-            .as_array()
-            .ok_or_else(|| anyhow::anyhow!("baggage.outputs must be an array"))?;
-        if outputs.is_empty() {
-            bail!("baggage.outputs may not be empty");
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("baggage must be an object"))?;
+        if baggage.contains_key("outputs") {
+            bail!("baggage.outputs is no longer accepted; output is bound at ingress");
         }
-        if outputs.len() > policy.limits.max_outputs {
-            bail!(
-                "too many outputs: {} > {}",
-                outputs.len(),
-                policy.limits.max_outputs
-            );
+        let raw_return = baggage
+            .get("autoscribe_return")
+            .ok_or_else(|| anyhow::anyhow!("response baggage missing autoscribe_return"))?;
+        let envelope: ReturnEnvelope = serde_json::from_value(raw_return.clone())
+            .context("invalid autoscribe_return envelope")?;
+        if envelope.schema != RETURN_SCHEMA {
+            bail!("unsupported return-route schema: {}", envelope.schema);
         }
+        safe_identifier(&envelope.record_id, "record_id", 160)?;
+        safe_identifier(&envelope.signature, "return signature", 96)?;
 
+        let signed_route = canonical_json(&json!({
+            "schema": RETURN_SCHEMA,
+            "record_id": envelope.record_id,
+            "route": envelope.route,
+        }));
+        verify_effect_signature(&secret, &signed_route, &envelope.signature)
+            .context("trusted return-route signature mismatch")?;
+        let effect = normalized_effect(&signed_route["route"], &policy)?;
         let content_sha256 = sha256_hex(response.content.as_bytes());
+        let signed_effect = canonical_json(&json!({
+            "schema": EFFECT_SCHEMA,
+            "call_id": response.call_id,
+            "effect_index": 0,
+            "effect": effect,
+            "content_sha256": content_sha256,
+        }));
+        let effect_key = effect_signature(&secret, &signed_effect)?;
 
-        for (index, raw) in outputs.iter().enumerate() {
-            reject_reserved_keys(raw)?;
-            let declaration: OutputDeclaration = serde_json::from_value(raw.clone())
-                .with_context(|| format!("invalid output declaration at index {index}"))?;
-
-            let normalized = match declaration {
-                OutputDeclaration::Repo {
-                    repo,
-                    path,
-                    branch,
-                    create_repo,
-                } => {
-                    let repo = validate_absolute_target(&repo, &policy.paths.repo_roots)?;
-                    validate_relative_path(&path)?;
-                    let branch = branch.unwrap_or_else(|| policy.git.default_branch.clone());
-                    validate_branch_name(&branch)?;
-                    json!({
-                        "kind":"repo",
-                        "repo":repo,
-                        "path":path,
-                        "branch":branch,
-                        "create_repo":create_repo,
-                    })
-                }
-                OutputDeclaration::File { path, mode } => {
-                    let path = validate_absolute_target(&path, &policy.paths.file_roots)?;
-                    json!({
-                        "kind":"file",
-                        "path":path,
-                        "mode":mode,
-                    })
-                }
-            };
-
-            let signed_payload = canonical_json(&json!({
-                "schema": EFFECT_SCHEMA,
-                "call_id": response.call_id.clone(),
-                "effect_index": index,
-                "effect": normalized,
-                "content_sha256": content_sha256.clone(),
-            }));
-            let effect_key = effect_signature(&secret, &signed_payload)?;
-
-            write_ndjson(&EffectRecord {
-                schema: EFFECT_SCHEMA.to_string(),
-                effect_key,
-                call_id: response.call_id.clone(),
-                effect_index: index,
-                effect: signed_payload["effect"].clone(),
-                content: response.content.clone(),
-                content_sha256: content_sha256.clone(),
-            })?;
-        }
-        Ok(())
+        write_ndjson(&EffectRecord {
+            schema: EFFECT_SCHEMA.to_string(),
+            effect_key,
+            call_id: signed_effect["call_id"]
+                .as_str()
+                .expect("call_id is text")
+                .to_string(),
+            effect_index: 0,
+            effect: signed_effect["effect"].clone(),
+            content: response.content,
+            content_sha256: signed_effect["content_sha256"]
+                .as_str()
+                .expect("content hash is text")
+                .to_string(),
+        })
     })
 }

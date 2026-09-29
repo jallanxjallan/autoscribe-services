@@ -2,163 +2,211 @@
 
 Rust trust-boundary operations for AutoScribe.
 
-This repository intentionally has **no `srv` catch-all executable**. Each operation is its own binary and shared implementation lives only in library crates.
+The core server boundary is deliberately limited to **two data modes**:
+
+1. **Repo mode** — invoked from a bare repository `post-receive` hook. Input is read from the pushed Git commit and every response is bound to the same source repository/path.
+2. **Direct mode** — invoked manually in the server terminal. Input is read from `dropbox:biznet/incoming/<batch>` and every response is bound to `dropbox:biznet/outgoing/<batch>`.
+
+There is no arbitrary source/output matrix in the core pipeline. Source gathering, publishing, HTML generation, Google Drive delivery, and other personal orchestration belong outside this package.
 
 ## Binaries
 
 | Binary | Boundary responsibility |
 | --- | --- |
-| `srv-input` | Read an explicitly declared file or Git blob from allow-listed roots and emit canonical `autoscribe.input.v1` NDJSON. |
-| `srv-output` | Parse response baggage, validate output declarations, normalize targets, and emit HMAC-authenticated `autoscribe.effect.v1` effects. |
-| `srv-control-ingest` | Read one exact commit from `control.git`, validate role/context/task/plan records, and atomically rebuild the trusted control SQLite DB. |
-| `srv-writeback` | Verify a trusted repo effect, write one path into a bare Git repo, make exactly one commit, push it, and record an idempotent receipt. |
-| `srv-export` | Verify a trusted file effect, atomically write the target, and record an idempotent receipt. |
+| `srv-input` | `repo` or `direct` ingress. Reads trusted source locations, validates content, emits canonical `autoscribe.input.v1` NDJSON, and signs the fixed return route. |
+| `srv-output` | Verifies the signed return route copied through response baggage and emits exactly one authenticated `autoscribe.effect.v1` effect. It does not accept `baggage.outputs`. |
+| `srv-control-ingest` | Reads one exact commit from `control.git`, validates Control records, and atomically rebuilds the trusted control SQLite DB. |
+| `srv-writeback` | Applies authenticated repo effects to the already-existing source bare repo. |
+| `srv-export` | Applies authenticated direct-mode effects only to `dropbox:biznet/outgoing/<batch>`. |
 
-`asc` remains a separate Python/application domain. These binaries do not contain Python pipeline logic.
+`asc` remains a separate Python/application domain. These binaries do not contain model or plan-execution logic.
 
 ## Trust model
 
 ```text
-agents / humans / files / Git
-              |
-              v
-           srv-input
-              |
-       canonical NDJSON
-              |
-              v
-             asc
-              |
-        response+baggage
-              |
-              v
-          srv-output
-              |
-   authenticated effect records
-        /               \
-       v                 v
-srv-writeback        srv-export
-       |                 |
-       v                 v
-      Git              files
+REPO MODE
 
-agents -> control.git -> srv-control-ingest -> trusted control.sqlite -> asc/control
+repo post-receive
+       |
+       v
+srv-input repo
+       |
+canonical NDJSON + signed same-repo return route
+       |
+       v
+   asc enqueue
+       |
+       v
+   response
+       |
+       v
+  srv-output
+       |
+ authenticated repo effect
+       |
+       v
+ srv-writeback
+       |
+       v
+same source repo/path
+
+
+DIRECT MODE
+
+dropbox:biznet/incoming/<batch>
+       |
+       v
+srv-input direct --batch <batch> --plan <pln_id>
+       |
+canonical NDJSON + signed matching-batch return route
+       |
+       v
+   asc enqueue
+       |
+       v
+   response
+       |
+       v
+  srv-output
+       |
+ authenticated Dropbox effect
+       |
+       v
+  srv-export
+       |
+       v
+dropbox:biznet/outgoing/<batch>
 ```
 
-Git history is transport/history, not trust. `control.git` is explicitly untrusted because agents may commit to it. The runtime control catalogue is the last successfully validated snapshot in SQLite.
+The Python pipeline receives a signed `baggage.autoscribe_return` envelope. It may carry that envelope through the call, but it cannot change the destination: `srv-output` verifies the signature before producing an effect.
 
-## Trusted effect keys
+Incoming response baggage containing the old `outputs` declaration is rejected.
 
-The Python pipeline is **not allowed to mint an effect key**. `srv-output`:
+## Repo mode
 
-1. rejects reserved effect/receipt keys in incoming baggage;
-2. parses the declarative `baggage.outputs` list;
-3. normalizes and allow-lists each target;
+`srv-input repo` resolves the supplied commit to an immutable SHA, reads its commit message, and looks for exactly one `Plan:` line. The final token on that line must be the canonical `pln_...` identity.
+
+A commit without a `Plan:` line is ignored successfully and emits no NDJSON. This is important because an AutoScribe writeback commit re-triggers `post-receive`; since the generated writeback commit has no `Plan:` line, it cannot recursively redispatch itself.
+
+Only added/modified Markdown files with leading YAML frontmatter are emitted as model inputs. Merge dispatch commits are rejected.
+
+Example:
+
+```bash
+srv-input \
+  --policy /etc/autoscribe/services.toml \
+  repo \
+  --repo /home/jeremy/Repos/book.git \
+  --commit "$newrev" \
+  --branch main \
+| asc enqueue
+```
+
+The corresponding return route contains only that same repo, source path, and branch. `create_repo` is always false.
+
+## Direct mode
+
+A batch name is supplied at invocation and is a single safe folder name. `srv-input` recursively lists that batch beneath the fixed incoming root and emits one canonical input record per UTF-8 file.
+
+Example:
+
+```bash
+srv-input \
+  --policy /etc/autoscribe/services.toml \
+  direct \
+  --batch jakarta-guide-01 \
+  --plan pln_0123456789ABCDEF \
+| asc enqueue
+```
+
+This reads only:
+
+```text
+dropbox:biznet/incoming/jakarta-guide-01/
+```
+
+and signs a return route that can resolve only to:
+
+```text
+dropbox:biznet/outgoing/jakarta-guide-01/
+```
+
+The relative path within the batch is preserved. For example:
+
+```text
+incoming/jakarta-guide-01/sources/museum.txt
+```
+
+returns to:
+
+```text
+outgoing/jakarta-guide-01/sources/museum.txt
+```
+
+`rclone` is invoked from `PATH`. For testing or controlled administration its executable may be overridden with the trusted `AUTOSCRIBE_RCLONE` environment variable.
+
+## Output contract
+
+The pipeline returns `autoscribe.response.v1` records carrying the original `baggage.autoscribe_return` envelope.
+
+`srv-output`:
+
+1. rejects the old caller-selected `baggage.outputs` field;
+2. verifies the ingress HMAC on `autoscribe_return`;
+3. revalidates the repo/batch/path against the locked mode;
 4. hashes the response content;
-5. HMAC-signs the normalized effect using `/etc/autoscribe/effect.key`.
+5. emits one authenticated effect.
 
-`srv-writeback` and `srv-export` reconstruct the signed payload and verify the HMAC before touching an external target. Changing the target, content hash, call id, or effect index invalidates the effect.
+Repo response:
 
-The key file must be at least 32 bytes and mode `0600` (or stricter). A 64-character hex key is accepted.
+```bash
+srv-output < response.ndjson | srv-writeback
+```
+
+Direct response:
+
+```bash
+srv-output < response.ndjson | srv-export
+```
+
+Effects remain HMAC authenticated and receipts remain idempotent. The Python pipeline never mints trusted effect keys.
+
+## Fixed external paths
+
+The personal direct mode intentionally fixes its Dropbox roots in the Rust boundary:
+
+```text
+dropbox:biznet/incoming
+dropbox:biznet/outgoing
+```
+
+There is no CLI option or response-baggage field for replacing those roots.
+
+Repo mode still permits only repositories below the configured `paths.repo_roots`.
+
+## Control
+
+Control remains independent of the two data modes:
+
+```text
+control.git -> srv-control-ingest -> trusted control SQLite -> asc
+```
+
+`control.git` is untrusted authoring/transport. The runtime catalogue is the last successfully validated SQLite snapshot.
 
 ## Server paths
 
-The example production shape is:
-
 ```text
 /home/jeremy/services/                         # development checkout
-/home/jeremy/Repos/*.git                      # data/output bare repos
+/home/jeremy/Repos/*.git                      # bare repos
 /opt/autoscribe/services/releases/<sha>/bin/  # immutable installed binaries
 /opt/autoscribe/services/current -> releases/<sha>
 /etc/autoscribe/services.toml                  # policy
 /etc/autoscribe/effect.key                     # HMAC key; never Git
-/var/lib/autoscribe/control.sqlite             # trusted control catalogue
-/var/lib/autoscribe/effects.sqlite             # applied-effect receipts
+/var/lib/autoscribe/effects.sqlite             # effect receipts
 ```
 
-## Policy
-
-Copy `config/services.toml.example` to `/etc/autoscribe/services.toml` and keep the allowed roots narrow. The example permits Git operations only under `/home/jeremy/Repos` and ordinary files only under `/var/lib/autoscribe/files`.
-
-Targets are required to be absolute, lexically safe, and contained by an allow-listed root. Existing symlink escapes are rejected. Paths *inside* a Git repo are required to be relative and may not contain `..`.
-
-## Input contract
-
-One request per NDJSON line.
-
-File input:
-
-```json
-{"schema":"autoscribe.input.request.v1","source":{"kind":"file","path":"/var/lib/autoscribe/files/draft.md"},"routing":{"plan_id":"pln_example"},"baggage":{}}
-```
-
-Git input:
-
-```json
-{"schema":"autoscribe.input.request.v1","source":{"kind":"git","repo":"/home/jeremy/Repos/book.git","commit":"main","path":"Contents/Opening.md"},"routing":{"plan_id":"pln_example"},"baggage":{}}
-```
-
-`srv-input` resolves Git refs to an immutable commit SHA and emits the actual UTF-8 content plus its SHA-256 digest.
-
-## Response/output contract
-
-The pipeline returns `autoscribe.response.v1` records. Output instructions live in `baggage.outputs` and remain declarative until `srv-output` validates them.
-
-Repo output:
-
-```json
-{"schema":"autoscribe.response.v1","call_id":"01EXAMPLE","content":"Rewritten text\n","baggage":{"outputs":[{"kind":"repo","repo":"/home/jeremy/Repos/book.git","path":"Contents/Opening.md","branch":"main","create_repo":false}]}}
-```
-
-File output:
-
-```json
-{"schema":"autoscribe.response.v1","call_id":"01EXAMPLE","content":"Rendered output\n","baggage":{"outputs":[{"kind":"file","path":"/var/lib/autoscribe/files/output.md","mode":"replace"}]}}
-```
-
-Pipe the result only to the adapter matching its effect kind:
-
-```bash
-srv-output < response.ndjson | srv-writeback
-srv-output < response.ndjson | srv-export
-```
-
-For mixed effects, a dispatcher should route each authenticated effect by `effect.kind`; do not pipe mixed effects to one adapter.
-
-## Git writeback semantics
-
-`srv-writeback` targets **bare repositories**. It serializes local writes per repo, clones a temporary worktree, rejects symlink traversal in the target path, writes the complete file, and creates one commit even when the content is unchanged (`--allow-empty`). The commit message contains the trusted effect key.
-
-Effect receipts make retries idempotent. If the process crashes after the Git push but before recording the receipt, the retry searches Git history for the effect key and reconstructs the receipt rather than creating another commit.
-
-## Control records
-
-Control is a data-only Git repository and is treated as untrusted. Canonical instruction records use the authored Control contract directly: `identity`, `type: instruction`, `scope`, `title`, `tags`, and the Markdown body. Instruction slugs and `component` aliases are rejected.
-
-Example task instruction:
-
-```yaml
----
-title: Example Task
-identity: spc_0123456789ABCDEF
-type: instruction
-scope: task
-tags: []
----
-Rewrite the supplied text without changing meaning.
-```
-
-The identity/scope mapping is:
-
-```text
-role     rol_<16 Crockford Base32 characters>
-context  ctx_<16 Crockford Base32 characters>
-task     spc_<16 Crockford Base32 characters>
-```
-
-The ingester rejects legacy instruction fields such as `slug`, `component`, `kind`, `version`, and embedded `role`/`context` composition. Plans remain slug-addressed records (`type: plan`) and may carry their canonical plan structure in frontmatter. Any `instructions` object found in a plan must contain exactly `role`, `context`, and `task` arrays, and every referenced identity must exist in the same Git snapshot with the matching scope.
-
-`control-pre-receive` validates a proposed `main` commit before accepting it. `control-post-receive` then atomically loads that exact commit into SQLite. Copy the hook files into the bare Control repo after the installed service path exists.
+The example policy keeps the Git repo root narrow. `file_roots` remains in the current shared policy schema for compatibility but is not an input/output route in the locked two-mode pipeline.
 
 ## Build and test
 
@@ -171,7 +219,7 @@ cargo test --workspace
 ./scripts/smoke.sh
 ```
 
-The smoke test creates only temporary repositories/files under `/tmp` and does not touch production data.
+The smoke test uses temporary repos and a fake local `rclone`; it does not touch production Dropbox or production repos.
 
 ## Install
 
@@ -181,4 +229,4 @@ After accepting a commit:
 ./scripts/install-server.sh
 ```
 
-The installer builds the release binaries, installs them beneath `/opt/autoscribe/services/releases/<git-sha>/bin`, and atomically repoints `/opt/autoscribe/services/current`. It does not create or overwrite secrets or production policy.
+The installer builds the release binaries beneath `/opt/autoscribe/services/releases/<sha>/bin` and atomically repoints `/opt/autoscribe/services/current`.
