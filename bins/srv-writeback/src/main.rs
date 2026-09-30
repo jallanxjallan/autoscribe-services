@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::{NamedTempFile, TempDir};
 
+const PROCESSED_PROPERTY: &str = "AutoScribe processed";
+
 #[derive(Parser, Debug)]
 #[command(about = "Apply authenticated repository write effects as one Git commit per effect")]
 struct Args {
@@ -143,6 +145,60 @@ fn repo_lock(repo: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn processed_timestamp() -> Result<String> {
+    let output = Command::new("date")
+        .env("TZ", "Asia/Jakarta")
+        .env("LC_ALL", "C")
+        .arg("+%d %B %Y, %H:%M:%S WIB")
+        .output()
+        .context("failed to create AutoScribe processed timestamp")?;
+    if !output.status.success() {
+        bail!(
+            "date failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let timestamp = String::from_utf8(output.stdout)?.trim().to_string();
+    if timestamp.is_empty() {
+        bail!("date returned an empty AutoScribe processed timestamp");
+    }
+    Ok(timestamp)
+}
+
+fn reconstruct_markdown(existing: &str, body: &str, processed_at: &str) -> String {
+    let mut lines = existing.lines();
+    let has_opening_fence = matches!(lines.next(), Some("---"));
+    let mut frontmatter = Vec::new();
+    let mut has_closing_fence = false;
+
+    if has_opening_fence {
+        for line in lines.by_ref() {
+            if line == "---" {
+                has_closing_fence = true;
+                break;
+            }
+            if !line.trim_start().starts_with(&format!("{PROCESSED_PROPERTY}:")) {
+                frontmatter.push(line);
+            }
+        }
+    }
+
+    let mut output = String::from("---\n");
+    if has_opening_fence && has_closing_fence {
+        for line in frontmatter {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output.push_str(PROCESSED_PROPERTY);
+    output.push_str(": \"");
+    output.push_str(processed_at);
+    output.push_str("\"\n---\n\n");
+    output.push_str(body);
+    output
+}
+
 fn prepare_clone(repo: &Path, branch: &str) -> Result<TempDir> {
     let tmp = tempfile::tempdir()?;
     let target = tmp.path().join("work");
@@ -219,9 +275,19 @@ fn apply_repo_effect(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("writeback target lacks parent"))?;
     fs::create_dir_all(parent)?;
+
+    let existing = if target.exists() {
+        fs::read_to_string(&target)
+            .with_context(|| format!("writeback target is not UTF-8: {}", rel_path.display()))?
+    } else {
+        String::new()
+    };
+    let processed_at = processed_timestamp()?;
+    let content = reconstruct_markdown(&existing, &record.content, &processed_at);
+
     let mut tmp_file = NamedTempFile::new_in(parent)?;
     use std::io::Write;
-    tmp_file.write_all(record.content.as_bytes())?;
+    tmp_file.write_all(content.as_bytes())?;
     tmp_file.flush()?;
     tmp_file.persist(&target).map_err(|e| e.error)?;
 
@@ -331,4 +397,49 @@ fn main() -> Result<()> {
         let receipt = record_receipt(&conn, &record.effect_key, "repo", &target, &commit)?;
         write_ndjson(&receipt)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconstruct_markdown;
+
+    #[test]
+    fn preserves_frontmatter_and_replaces_body() {
+        let existing = "---\ntitle: Home\nidentity: psg_HOME\n---\n\nOld body.\n";
+        let got = reconstruct_markdown(
+            existing,
+            "# New body\n\nFresh response.",
+            "30 September 2026, 07:18:42 WIB",
+        );
+        assert_eq!(
+            got,
+            "---\ntitle: Home\nidentity: psg_HOME\nAutoScribe processed: \"30 September 2026, 07:18:42 WIB\"\n---\n\n# New body\n\nFresh response."
+        );
+    }
+
+    #[test]
+    fn replaces_previous_processed_property() {
+        let existing = "---\ntitle: Home\nAutoScribe processed: \"29 September 2026, 18:00:00 WIB\"\nstatus: draft\n---\n\nOld body.\n";
+        let got = reconstruct_markdown(
+            existing,
+            "New body.",
+            "30 September 2026, 07:18:42 WIB",
+        );
+        assert_eq!(got.matches("AutoScribe processed:").count(), 1);
+        assert!(got.contains("status: draft\nAutoScribe processed: \"30 September 2026, 07:18:42 WIB\""));
+        assert!(got.ends_with("\n\nNew body."));
+    }
+
+    #[test]
+    fn creates_human_frontmatter_when_missing() {
+        let got = reconstruct_markdown(
+            "Old body only.\n",
+            "New body only.",
+            "30 September 2026, 07:18:42 WIB",
+        );
+        assert_eq!(
+            got,
+            "---\nAutoScribe processed: \"30 September 2026, 07:18:42 WIB\"\n---\n\nNew body only."
+        );
+    }
 }
