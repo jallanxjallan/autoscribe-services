@@ -1,32 +1,61 @@
-#!/bin/sh
-set -eu
+#!/usr/bin/env bash
+set -euo pipefail
 
 INPUT=/opt/autoscribe/services/current/bin/srv-input
 ASC=/opt/autoscribe/app/bin/asc
 POLICY=/etc/autoscribe/services.toml
+OUTPUT_BRANCH=autoscribe-output
 REPO=$(pwd -P)
 ZERO=0000000000000000000000000000000000000000
 
-while read oldrev newrev refname; do
-    case "$refname" in
-        refs/heads/*) branch=${refname#refs/heads/} ;;
-        *) continue ;;
-    esac
-    [ "$newrev" = "$ZERO" ] && continue
+log_error() {
+    logger -t autoscribe-post-receive -- "$*"
+    printf 'AutoScribe: %s\n' "$*" >&2
+}
 
-    if [ "$oldrev" = "$ZERO" ]; then
-        commits=$(git --git-dir="$REPO" rev-list --reverse "$newrev")
+while read -r oldrev newrev refname; do
+    # Only user commits on master dispatch work. AutoScribe writeback goes to
+    # autoscribe-output and must never recursively dispatch itself.
+    [[ "$refname" == "refs/heads/master" ]] || continue
+    [[ "$newrev" != "$ZERO" ]] || continue
+
+    if [[ "$oldrev" == "$ZERO" ]]; then
+        commits="$newrev"
     else
         commits=$(git --git-dir="$REPO" rev-list --reverse "$oldrev..$newrev")
     fi
 
-    for commit in $commits; do
-        "$INPUT" \
+    while IFS= read -r commit; do
+        [[ -n "$commit" ]] || continue
+
+        tmp=$(mktemp)
+        trap 'rm -f "$tmp"' EXIT
+
+        if ! "$INPUT" \
             --policy "$POLICY" \
             repo \
             --repo "$REPO" \
             --commit "$commit" \
-            --branch "$branch" \
-        | "$ASC" enqueue
-    done
+            --branch "$OUTPUT_BRANCH" \
+            > "$tmp"
+        then
+            log_error "srv-input failed for commit $commit"
+            exit 1
+        fi
+
+        # A master commit without an AutoScribe payload is not an error.
+        if [[ ! -s "$tmp" ]]; then
+            rm -f "$tmp"
+            trap - EXIT
+            continue
+        fi
+
+        if ! "$ASC" enqueue < "$tmp"; then
+            log_error "asc enqueue failed for commit $commit"
+            exit 1
+        fi
+
+        rm -f "$tmp"
+        trap - EXIT
+    done <<< "$commits"
 done
