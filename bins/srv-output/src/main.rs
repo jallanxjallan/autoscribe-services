@@ -10,6 +10,7 @@ use srv_common::{
 use std::path::{Path, PathBuf};
 
 const RETURN_SCHEMA: &str = "autoscribe.return.v1";
+const REPO_OUTPUT_BRANCH: &str = "autoscribe-output";
 
 #[derive(Parser, Debug)]
 #[command(about = "Verify the trusted input return route and emit one authenticated output effect")]
@@ -82,18 +83,17 @@ fn normalized_effect(route: &Value, policy: &srv_common::Policy) -> Result<Value
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow::anyhow!("repo route missing path"))?,
             );
-            let branch = route
-                .get("branch")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("repo route missing branch"))?;
+            if let Some(branch) = route.get("branch").and_then(Value::as_str) {
+                validate_branch_name(branch)?;
+            }
             let repo = validate_absolute_target(&repo, &policy.paths.repo_roots)?;
             validate_relative_path(&path)?;
-            validate_branch_name(branch)?;
+            validate_branch_name(REPO_OUTPUT_BRANCH)?;
             Ok(json!({
                 "kind": "repo",
                 "repo": repo,
                 "path": path,
-                "branch": branch,
+                "branch": REPO_OUTPUT_BRANCH,
                 "create_repo": false,
             }))
         }
