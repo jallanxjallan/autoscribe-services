@@ -30,6 +30,7 @@ struct EffectRecord {
     effect_key: String,
     call_id: String,
     effect_index: usize,
+    replay_id: Option<String>,
     effect: Value,
     content: String,
     content_sha256: String,
@@ -85,17 +86,24 @@ fn main() -> Result<()> {
             bail!("unsupported effect schema: {}", record.schema);
         }
         safe_identifier(&record.call_id, "call_id", 160)?;
+        if let Some(replay_id) = record.replay_id.as_deref() {
+            safe_identifier(replay_id, "replay_id", 160)?;
+        }
         if sha256_hex(record.content.as_bytes()) != record.content_sha256 {
             bail!("effect content hash mismatch");
         }
 
-        let signed_payload = canonical_json(&json!({
+        let mut payload = json!({
             "schema": EFFECT_SCHEMA,
             "call_id": record.call_id.clone(),
             "effect_index": record.effect_index,
             "effect": record.effect.clone(),
             "content_sha256": record.content_sha256.clone(),
-        }));
+        });
+        if let Some(replay_id) = record.replay_id.as_deref() {
+            payload["replay_id"] = Value::String(replay_id.to_string());
+        }
+        let signed_payload = canonical_json(&payload);
         verify_effect_signature(&secret, &signed_payload, &record.effect_key)?;
 
         let effect = signed_payload["effect"]
