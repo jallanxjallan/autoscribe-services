@@ -162,6 +162,29 @@ COUNT=$(git --git-dir "$TMP/repos/content.git" rev-list --count main)
 cmp "$TMP/repo-receipt.ndjson" "$TMP/repo-receipt-2.ndjson"
 [ "$(git --git-dir "$TMP/repos/content.git" rev-list --count main)" = "2" ]
 
+"$BIN/srv-output" --policy "$POLICY" --replay-id rpl_SMOKE_REPO \
+  < "$TMP/repo-response.ndjson" > "$TMP/repo-replay-effect.ndjson"
+python3 - <<PY
+import json
+first=json.loads(open("$TMP/repo-effect.ndjson").read())
+replay=json.loads(open("$TMP/repo-replay-effect.ndjson").read())
+assert replay["call_id"] == first["call_id"]
+assert replay["replay_id"] == "rpl_SMOKE_REPO"
+assert replay["effect"] == first["effect"]
+assert replay["content_sha256"] == first["content_sha256"]
+assert replay["effect_key"] != first["effect_key"]
+PY
+"$BIN/srv-writeback" --policy "$POLICY" \
+  < "$TMP/repo-replay-effect.ndjson" > "$TMP/repo-replay-receipt.ndjson"
+[ "$(git --git-dir "$TMP/repos/content.git" rev-list --count main)" = "3" ]
+python3 - <<PY
+import json
+first=json.loads(open("$TMP/repo-receipt.ndjson").read())
+replay=json.loads(open("$TMP/repo-replay-receipt.ndjson").read())
+assert replay["effect_key"] != first["effect_key"]
+assert replay["result"] != first["result"]
+PY
+
 echo '[4/7] Writeback commit does not redispatch because it has no Plan: line'
 WRITEBACK_SHA=$(git --git-dir "$TMP/repos/content.git" rev-parse main)
 "$BIN/srv-input" --policy "$POLICY" repo \
@@ -213,6 +236,22 @@ r=json.loads(open("$TMP/direct-effect.ndjson").read())
 assert r["effect"] == {"kind":"dropbox","batch":"smoke-batch","path":"note.txt"}
 PY
 "$BIN/srv-export" --policy "$POLICY" < "$TMP/direct-effect.ndjson" > "$TMP/direct-receipt.ndjson"
+[ "$(cat "$TMP/dropbox/outgoing/smoke-batch/note.txt")" = "Rewritten direct text." ]
+
+"$BIN/srv-output" --policy "$POLICY" --replay-id rpl_SMOKE_DIRECT \
+  < "$TMP/direct-response.ndjson" > "$TMP/direct-replay-effect.ndjson"
+"$BIN/srv-export" --policy "$POLICY" \
+  < "$TMP/direct-replay-effect.ndjson" > "$TMP/direct-replay-receipt.ndjson"
+python3 - <<PY
+import json
+first=json.loads(open("$TMP/direct-effect.ndjson").read())
+replay=json.loads(open("$TMP/direct-replay-effect.ndjson").read())
+assert replay["call_id"] == first["call_id"]
+assert replay["replay_id"] == "rpl_SMOKE_DIRECT"
+assert replay["effect"] == first["effect"]
+assert replay["content_sha256"] == first["content_sha256"]
+assert replay["effect_key"] != first["effect_key"]
+PY
 [ "$(cat "$TMP/dropbox/outgoing/smoke-batch/note.txt")" = "Rewritten direct text." ]
 
 echo 'AutoScribe locked-mode services smoke test: PASS'
