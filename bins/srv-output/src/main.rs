@@ -17,6 +17,9 @@ const REPO_OUTPUT_BRANCH: &str = "autoscribe-output";
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
     policy: PathBuf,
+
+    #[arg(long)]
+    replay_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +44,8 @@ struct EffectRecord {
     effect_key: String,
     call_id: String,
     effect_index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_id: Option<String>,
     effect: Value,
     content: String,
     content_sha256: String,
@@ -125,6 +130,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let policy = load_policy(&args.policy)?;
     let secret = read_effect_key(&policy.paths.effect_key_file)?;
+    if let Some(replay_id) = args.replay_id.as_deref() {
+        safe_identifier(replay_id, "replay_id", 160)?;
+    }
 
     read_ndjson::<ResponseRecord, _>(policy.limits.max_record_bytes, |response| {
         if response.schema != RESPONSE_SCHEMA {
@@ -164,13 +172,17 @@ fn main() -> Result<()> {
             .context("trusted return-route signature mismatch")?;
         let effect = normalized_effect(&signed_route["route"], &policy)?;
         let content_sha256 = sha256_hex(response.content.as_bytes());
-        let signed_effect = canonical_json(&json!({
+        let mut effect_payload = json!({
             "schema": EFFECT_SCHEMA,
             "call_id": response.call_id,
             "effect_index": 0,
             "effect": effect,
             "content_sha256": content_sha256,
-        }));
+        });
+        if let Some(replay_id) = args.replay_id.as_deref() {
+            effect_payload["replay_id"] = Value::String(replay_id.to_string());
+        }
+        let signed_effect = canonical_json(&effect_payload);
         let effect_key = effect_signature(&secret, &signed_effect)?;
 
         write_ndjson(&EffectRecord {
@@ -181,6 +193,7 @@ fn main() -> Result<()> {
                 .expect("call_id is text")
                 .to_string(),
             effect_index: 0,
+            replay_id: args.replay_id.clone(),
             effect: signed_effect["effect"].clone(),
             content: response.content,
             content_sha256: signed_effect["content_sha256"]
