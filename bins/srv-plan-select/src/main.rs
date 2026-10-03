@@ -135,7 +135,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        let index: usize = match choice.parse() {
+        let index: usize = match choice.parse::<usize>() {
             Ok(value) if value >= 1 && value <= plans.len() => value - 1,
             _ => {
                 eprintln!("Choose 1-{} or q.", plans.len());
