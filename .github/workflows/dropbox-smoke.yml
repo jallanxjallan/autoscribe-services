@@ -1,0 +1,34 @@
+name: Dropbox NDJSON smoke
+
+on:
+  push:
+    branches:
+      - dropbox-ndjson-daemons
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout services
+        uses: actions/checkout@v4
+
+      - name: Checkout AutoScribe core transport branch
+        uses: actions/checkout@v4
+        with:
+          repository: jallanxjallan/autoscribe
+          ref: dropbox-transport-core
+          path: autoscribe
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Redis
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+
+      - name: Run Dropbox round-trip smoke
+        run: |
+          chmod +x scripts/smoke-dropbox-roundtrip.sh
+          scripts/smoke-dropbox-roundtrip.sh "$GITHUB_WORKSPACE/autoscribe"
