@@ -32,7 +32,9 @@ impl RawMode {
         }
 
         let mut raw = unsafe { std::ptr::read(&original) };
-        unsafe { libc::cfmakeraw(&mut raw) };
+        // We only need character-at-a-time keyboard input. Keep the terminal's
+        // normal output processing intact so newlines still return to column 1.
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 1;
 
@@ -96,12 +98,23 @@ fn render(plans: &[Plan], selected: usize) -> Result<()> {
     print!("\x1b[2J\x1b[H");
     println!("AutoScribe plans\n");
 
+    let label_width = plans
+        .iter()
+        .map(|plan| clean_label(&plan.label).chars().count())
+        .max()
+        .unwrap_or(0);
+
     for (index, plan) in plans.iter().enumerate() {
         let label = clean_label(&plan.label);
         if index == selected {
-            println!("\x1b[7m> {}\t{}\x1b[0m", label, plan.id);
+            println!(
+                "\x1b[7m> {:width$}  {}\x1b[0m",
+                label,
+                plan.id,
+                width = label_width
+            );
         } else {
-            println!("  {}\t{}", label, plan.id);
+            println!("  {:width$}  {}", label, plan.id, width = label_width);
         }
     }
 
