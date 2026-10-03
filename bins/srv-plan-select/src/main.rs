@@ -2,11 +2,11 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rusqlite::Connection;
 use srv_common::load_policy;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(about = "Select an AutoScribe plan and copy its human label plus identity via OSC 52")]
+#[command(about = "Select an AutoScribe plan")]
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
     policy: PathBuf,
@@ -16,6 +16,45 @@ struct Args {
 struct Plan {
     id: String,
     label: String,
+}
+
+struct RawMode {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+impl RawMode {
+    fn enter() -> Result<Self> {
+        let fd = libc::STDIN_FILENO;
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return Err(io::Error::last_os_error()).context("failed to read terminal mode");
+        }
+
+        let mut raw = unsafe { std::ptr::read(&original) };
+        unsafe { libc::cfmakeraw(&mut raw) };
+        raw.c_cc[libc::VMIN] = 0;
+        raw.c_cc[libc::VTIME] = 1;
+
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(io::Error::last_os_error()).context("failed to enter raw terminal mode");
+        }
+
+        print!("\x1b[?25l");
+        io::stdout().flush()?;
+
+        Ok(Self { fd, original })
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+        print!("\x1b[?25h\x1b[0m");
+        let _ = io::stdout().flush();
+    }
 }
 
 fn clean_label(label: &str) -> String {
@@ -32,9 +71,8 @@ fn list_plans(db_path: &PathBuf) -> Result<Vec<Plan>> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open control DB {}", db_path.display()))?;
 
-    let mut stmt = conn.prepare(
-        "SELECT id, label FROM plans ORDER BY label COLLATE NOCASE, id",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, label FROM plans ORDER BY label COLLATE NOCASE, id")?;
 
     let rows = stmt.query_map([], |row| {
         Ok(Plan {
@@ -54,51 +92,90 @@ fn list_plans(db_path: &PathBuf) -> Result<Vec<Plan>> {
     Ok(plans)
 }
 
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+fn render(plans: &[Plan], selected: usize) -> Result<()> {
+    print!("\x1b[2J\x1b[H");
+    println!("AutoScribe plans\n");
 
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-
-    while i + 3 <= bytes.len() {
-        let n = ((bytes[i] as u32) << 16)
-            | ((bytes[i + 1] as u32) << 8)
-            | bytes[i + 2] as u32;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        i += 3;
+    for (index, plan) in plans.iter().enumerate() {
+        let label = clean_label(&plan.label);
+        if index == selected {
+            println!("\x1b[7m> {}\t{}\x1b[0m", label, plan.id);
+        } else {
+            println!("  {}\t{}", label, plan.id);
+        }
     }
 
-    match bytes.len() - i {
-        1 => {
-            let n = (bytes[i] as u32) << 16;
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-            out.push('=');
-            out.push('=');
-        }
-        2 => {
-            let n = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-            out.push('=');
-        }
-        _ => {}
-    }
-
-    out
+    println!("\n↑/↓ select   Enter choose   Esc exit");
+    io::stdout().flush()?;
+    Ok(())
 }
 
-fn copy_osc52(text: &str) -> Result<()> {
-    let encoded = base64(text.as_bytes());
-    let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b]52;c;{}\x07", encoded)?;
-    stdout.flush()?;
-    Ok(())
+fn read_byte(stdin: &mut impl Read) -> Result<Option<u8>> {
+    let mut byte = [0u8; 1];
+    match stdin.read(&mut byte)? {
+        0 => Ok(None),
+        _ => Ok(Some(byte[0])),
+    }
+}
+
+fn select_plan(plans: &[Plan]) -> Result<Option<usize>> {
+    let _raw = RawMode::enter()?;
+    let mut selected = 0usize;
+    let mut stdin = io::stdin().lock();
+
+    render(plans, selected)?;
+
+    loop {
+        let Some(byte) = read_byte(&mut stdin)? else {
+            continue;
+        };
+
+        match byte {
+            b'\r' | b'\n' => {
+                print!("\x1b[2J\x1b[H");
+                io::stdout().flush()?;
+                return Ok(Some(selected));
+            }
+            0x1b => {
+                let second = read_byte(&mut stdin)?;
+                if second.is_none() {
+                    print!("\x1b[2J\x1b[H");
+                    io::stdout().flush()?;
+                    return Ok(None);
+                }
+                if second == Some(b'[') {
+                    match read_byte(&mut stdin)? {
+                        Some(b'A') => {
+                            selected = if selected == 0 {
+                                plans.len() - 1
+                            } else {
+                                selected - 1
+                            };
+                            render(plans, selected)?;
+                        }
+                        Some(b'B') => {
+                            selected = (selected + 1) % plans.len();
+                            render(plans, selected)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            b'k' => {
+                selected = if selected == 0 {
+                    plans.len() - 1
+                } else {
+                    selected - 1
+                };
+                render(plans, selected)?;
+            }
+            b'j' => {
+                selected = (selected + 1) % plans.len();
+                render(plans, selected)?;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -110,45 +187,11 @@ fn main() -> Result<()> {
         bail!("no plans found in {}", policy.paths.control_db.display());
     }
 
-    println!("AutoScribe plans:\n");
-    for (index, plan) in plans.iter().enumerate() {
-        println!(
-            "{:>3}. {}\t{}",
-            index + 1,
-            clean_label(&plan.label),
-            plan.id
-        );
-    }
-    println!("  q. Bail");
-
-    loop {
-        print!("\nSelect plan: ");
-        io::stdout().flush()?;
-
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input)? == 0 {
-            return Ok(());
-        }
-        let choice = input.trim();
-
-        if choice.eq_ignore_ascii_case("q") || choice.eq_ignore_ascii_case("quit") {
-            return Ok(());
-        }
-
-        let index: usize = match choice.parse::<usize>() {
-            Ok(value) if value >= 1 && value <= plans.len() => value - 1,
-            _ => {
-                eprintln!("Choose 1-{} or q.", plans.len());
-                continue;
-            }
-        };
-
-        let plan = &plans[index];
-        let paste = format!("{}\t{}", clean_label(&plan.label), plan.id);
-
-        copy_osc52(&paste)?;
-        println!("\n{}", paste);
-        println!("Sent to terminal clipboard via OSC 52.");
+    let Some(index) = select_plan(&plans)? else {
         return Ok(());
-    }
+    };
+
+    let plan = &plans[index];
+    println!("{}\t{}", clean_label(&plan.label), plan.id);
+    Ok(())
 }
