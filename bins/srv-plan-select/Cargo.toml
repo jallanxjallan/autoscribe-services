@@ -7,5 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 srv-common = { path = "../../crates/srv-common" }
