@@ -1,154 +1,221 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use fs2::FileExt;
-use serde::Deserialize;
 use serde_json::{json, Value};
-use srv_common::{
-    canonical_json, existing_receipt, load_policy, open_effects_db, read_effect_key, read_ndjson,
-    record_receipt, run_checked, safe_identifier, sha256_hex, validate_relative_path,
-    verify_effect_signature, write_ndjson, EFFECT_SCHEMA,
-};
+use srv_common::{load_policy, safe_identifier, sha256_hex};
 use std::ffi::OsString;
-use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use tempfile::NamedTempFile;
 
 const DROPBOX_OUTGOING: &str = "dropbox:biznet/outgoing";
 
 #[derive(Parser, Debug)]
-#[command(about = "Apply authenticated direct-mode effects to the fixed Dropbox outgoing root")]
+#[command(
+    about = "Poll AutoScribe pending exports and write response NDJSON to Dropbox"
+)]
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
     policy: PathBuf,
-}
 
-#[derive(Debug, Deserialize)]
-struct EffectRecord {
-    schema: String,
-    effect_key: String,
-    call_id: String,
-    effect_index: usize,
-    replay_id: Option<String>,
-    effect: Value,
-    content: String,
-    content_sha256: String,
+    /// Process the current export queue once and exit.
+    #[arg(long)]
+    once: bool,
+
+    /// Poll interval in seconds when running as a daemon.
+    #[arg(long, default_value_t = 1.0)]
+    poll_seconds: f64,
 }
 
 fn rclone_binary() -> OsString {
     std::env::var_os("AUTOSCRIBE_RCLONE").unwrap_or_else(|| OsString::from("rclone"))
 }
 
-fn safe_batch(value: &str) -> Result<()> {
-    safe_identifier(value, "batch", 96)?;
-    if value == "." || value == ".." || value.contains('/') || value.contains(':') {
-        bail!("batch must be a single folder name");
-    }
-    Ok(())
+fn asc_binary() -> OsString {
+    std::env::var_os("AUTOSCRIBE_ASC").unwrap_or_else(|| OsString::from("asc"))
 }
 
-fn safe_dropbox_path(path: &Path) -> Result<()> {
-    validate_relative_path(path)?;
-    let text = path
+fn command_output(program: OsString, args: &[&str], label: &str) -> Result<Vec<u8>> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to execute {label}"))?;
+    if !output.status.success() {
+        bail!(
+            "{label} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn asc_output(args: &[&str], label: &str) -> Result<Vec<u8>> {
+    command_output(asc_binary(), args, label)
+}
+
+fn rclone_output(args: &[&str], label: &str) -> Result<Vec<u8>> {
+    command_output(rclone_binary(), args, label)
+}
+
+fn pending_records(max_record_bytes: usize) -> Result<Vec<Value>> {
+    let output = asc_output(&["export", "pending"], "asc export pending")?;
+    let text = String::from_utf8(output).context("asc export pending is not UTF-8")?;
+    let mut records = Vec::new();
+
+    for (index, raw) in text.lines().enumerate() {
+        let line_number = index + 1;
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if raw.as_bytes().len() > max_record_bytes {
+            bail!("pending export line {line_number} exceeds {max_record_bytes} bytes");
+        }
+        let value: Value = serde_json::from_str(raw)
+            .with_context(|| format!("pending export line {line_number} is invalid JSON"))?;
+        records.push(value);
+    }
+    Ok(records)
+}
+
+fn process_record(record: &Value, max_body_bytes: usize) -> Result<()> {
+    let object = record
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("pending export must be a JSON object"))?;
+
+    let schema = object.get("schema").and_then(Value::as_str).unwrap_or("");
+    if schema != "autoscribe.export-pending.v1" {
+        let message = object
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unsupported pending export schema");
+        bail!("{message}");
+    }
+
+    let call_id = object
+        .get("call_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("pending export missing call_id"))?;
+    safe_identifier(call_id, "call_id", 160)?;
+
+    let baggage = object
+        .get("baggage")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("pending export missing baggage"))?;
+    if !baggage.is_object() {
+        bail!("pending export baggage must be a JSON object");
+    }
+
+    let content = asc_output(
+        &["export", "content", call_id],
+        "asc export content",
+    )?;
+    if content.len() > max_body_bytes {
+        bail!("response content exceeds {max_body_bytes} bytes");
+    }
+    let result = String::from_utf8(content).context("response content is not UTF-8")?;
+    let result_sha256 = sha256_hex(result.as_bytes());
+
+    let response = json!({
+        "schema": "autoscribe.client-response.v1",
+        "call_id": call_id,
+        "result": result,
+        "baggage": baggage,
+    });
+
+    let final_remote = format!("{DROPBOX_OUTGOING}/{call_id}.ndjson");
+    let partial_remote = format!("{DROPBOX_OUTGOING}/.{call_id}.ndjson.partial");
+
+    let mut tmp = NamedTempFile::new().context("failed creating temporary response file")?;
+    serde_json::to_writer(&mut tmp, &response)?;
+    tmp.write_all(b"\n")?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+
+    let local = tmp
+        .path()
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Dropbox path must be UTF-8"))?;
-    if text.chars().any(char::is_control) || text.contains('\\') {
-        bail!("Dropbox path contains unsafe characters");
-    }
+        .ok_or_else(|| anyhow::anyhow!("temporary response path is not UTF-8"))?;
+    rclone_output(
+        &["copyto", local, &partial_remote],
+        "rclone copyto partial outgoing response",
+    )?;
+    rclone_output(
+        &["moveto", &partial_remote, &final_remote],
+        "rclone moveto final outgoing response",
+    )?;
+
+    asc_output(
+        &[
+            "export",
+            "complete",
+            call_id,
+            &final_remote,
+            &result_sha256,
+        ],
+        "asc export complete",
+    )?;
+
+    println!(
+        "{}",
+        json!({
+            "event": "export_written",
+            "call_id": call_id,
+            "target": final_remote,
+            "result_sha256": result_sha256,
+        })
+    );
     Ok(())
 }
 
-fn effect_lock(db_path: &Path, effect_key: &str) -> Result<File> {
-    safe_identifier(effect_key, "effect_key", 96)?;
-    let parent = db_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("effects DB must have a parent directory"))?;
-    let dir = parent.join("effect-locks");
-    fs::create_dir_all(&dir)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join(effect_key))?;
-    file.lock_exclusive()?;
-    Ok(file)
+fn poll_once(max_record_bytes: usize, max_body_bytes: usize) -> Result<()> {
+    let records = pending_records(max_record_bytes)?;
+    let mut failures = 0usize;
+
+    for record in records {
+        if let Err(error) = process_record(&record, max_body_bytes) {
+            failures += 1;
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "export_failed",
+                    "call_id": record.get("call_id"),
+                    "error": error.to_string(),
+                })
+            );
+        }
+    }
+
+    if failures == 0 {
+        Ok(())
+    } else {
+        bail!("{failures} pending export(s) failed")
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if !args.poll_seconds.is_finite() || args.poll_seconds <= 0.0 {
+        bail!("poll-seconds must be greater than zero");
+    }
     let policy = load_policy(&args.policy)?;
-    let secret = read_effect_key(&policy.paths.effect_key_file)?;
 
-    read_ndjson::<EffectRecord, _>(policy.limits.max_record_bytes, |record| {
-        if record.schema != EFFECT_SCHEMA {
-            bail!("unsupported effect schema: {}", record.schema);
-        }
-        safe_identifier(&record.call_id, "call_id", 160)?;
-        if let Some(replay_id) = record.replay_id.as_deref() {
-            safe_identifier(replay_id, "replay_id", 160)?;
-        }
-        if sha256_hex(record.content.as_bytes()) != record.content_sha256 {
-            bail!("effect content hash mismatch");
-        }
-
-        let mut payload = json!({
-            "schema": EFFECT_SCHEMA,
-            "call_id": record.call_id.clone(),
-            "effect_index": record.effect_index,
-            "effect": record.effect.clone(),
-            "content_sha256": record.content_sha256.clone(),
-        });
-        if let Some(replay_id) = record.replay_id.as_deref() {
-            payload["replay_id"] = Value::String(replay_id.to_string());
-        }
-        let signed_payload = canonical_json(&payload);
-        verify_effect_signature(&secret, &signed_payload, &record.effect_key)?;
-
-        let effect = signed_payload["effect"]
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("effect must be an object"))?;
-        if effect.get("kind").and_then(Value::as_str) != Some("dropbox") {
-            bail!("srv-export accepts only direct-mode Dropbox effects");
-        }
-        let batch = effect
-            .get("batch")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Dropbox effect missing batch"))?;
-        safe_batch(batch)?;
-        let path = PathBuf::from(
-            effect
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("Dropbox effect missing path"))?,
+    loop {
+        let result = poll_once(
+            policy.limits.max_record_bytes,
+            policy.limits.max_body_bytes,
         );
-        safe_dropbox_path(&path)?;
-        let remote = format!("{DROPBOX_OUTGOING}/{batch}/{}", path.display());
-
-        let _effect_lock = effect_lock(&policy.paths.effects_db, &record.effect_key)?;
-        let conn = open_effects_db(&policy.paths.effects_db)?;
-        if let Some(receipt) = existing_receipt(&conn, &record.effect_key)? {
-            return write_ndjson(&receipt);
+        if args.once {
+            return result;
         }
-
-        let mut tmp = NamedTempFile::new().context("failed creating temporary export file")?;
-        tmp.write_all(record.content.as_bytes())?;
-        tmp.flush()?;
-        tmp.as_file().sync_all()?;
-
-        let mut cmd = Command::new(rclone_binary());
-        cmd.arg("copyto").arg(tmp.path()).arg(&remote);
-        run_checked(cmd, "rclone copyto outgoing batch")
-            .with_context(|| format!("failed exporting to {remote}"))?;
-
-        let receipt = record_receipt(
-            &conn,
-            &record.effect_key,
-            "dropbox",
-            &remote,
-            &record.content_sha256,
-        )?;
-        write_ndjson(&receipt)
-    })
+        if let Err(error) = result {
+            eprintln!(
+                "{}",
+                json!({"event":"export_poll_failed","error":error.to_string()})
+            );
+        }
+        thread::sleep(Duration::from_secs_f64(args.poll_seconds));
+    }
 }
