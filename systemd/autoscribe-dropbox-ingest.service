@@ -1,0 +1,15 @@
+[Unit]
+Description=AutoScribe Dropbox NDJSON ingress
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=AUTOSCRIBE_ASC=%h/.local/bin/asc
+Environment=AUTOSCRIBE_RCLONE=%h/.local/bin/rclone
+ExecStart=/opt/autoscribe/services/current/bin/srv-input --policy /etc/autoscribe/services.toml --poll-seconds 1
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
