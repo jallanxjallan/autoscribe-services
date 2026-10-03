@@ -7,6 +7,7 @@ members = [
   "bins/srv-control-ingest",
   "bins/srv-writeback",
   "bins/srv-export",
+  "bins/srv-plan-select",
 ]
 
 [workspace.package]

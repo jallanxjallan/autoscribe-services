@@ -1,0 +1,11 @@
+[package]
+name = "srv-plan-select"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+srv-common = { path = "../../crates/srv-common" }

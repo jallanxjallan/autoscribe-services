@@ -12,7 +12,7 @@ fi
 SHA=$(git rev-parse HEAD)
 RELEASE="/opt/autoscribe/services/releases/$SHA"
 CURRENT="/opt/autoscribe/services/current"
-BINS=(srv-input srv-output srv-control-ingest srv-writeback srv-export)
+BINS=(srv-input srv-output srv-control-ingest srv-writeback srv-export srv-plan-select)
 
 cargo build --release --workspace
 
