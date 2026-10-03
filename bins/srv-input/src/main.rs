@@ -137,9 +137,9 @@ fn canonical_input(
     let baggage = Value::Object(object);
     let content_sha256 = sha256_hex(content.as_bytes());
     let identity = json!({
-        "plan": plan,
-        "content_sha256": content_sha256,
-        "baggage": baggage,
+        "plan": &plan,
+        "content_sha256": &content_sha256,
+        "baggage": &baggage,
     });
     let record_id = format!(
         "inp_{}",
@@ -157,7 +157,7 @@ fn canonical_input(
         content,
         content_sha256,
         routing: json!({"plan_id": plan}),
-        baggage: identity["baggage"].clone(),
+        baggage,
     })
 }
 
