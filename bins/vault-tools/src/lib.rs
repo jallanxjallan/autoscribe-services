@@ -296,6 +296,11 @@ pub fn initialize_backup_repo(vault: &Path, repos_root: &Path) -> Result<InitRep
 
     write_managed_gitignore(vault)?;
 
+    // New vaults are initialized on main, but an existing vault may legitimately
+    // still use another branch name. Make a newly-created bare backup agree with
+    // the local repository so a later clone has a valid HEAD.
+    let branch = current_branch(vault)?;
+
     let remote_created = if remote.exists() {
         ensure_bare_repo(&remote)?;
         false
@@ -303,7 +308,7 @@ pub fn initialize_backup_repo(vault: &Path, repos_root: &Path) -> Result<InitRep
         let status = Command::new("git")
             .arg("init")
             .arg("--bare")
-            .arg("--initial-branch=main")
+            .arg(format!("--initial-branch={branch}"))
             .arg(&remote)
             .status()
             .with_context(|| format!("failed to create bare repository {}", remote.display()))?;
@@ -314,8 +319,6 @@ pub fn initialize_backup_repo(vault: &Path, repos_root: &Path) -> Result<InitRep
     };
 
     ensure_origin(vault, &remote)?;
-
-    let branch = current_branch(vault)?;
 
     if initialized {
         run_git(vault, &["add", "-A"])?;
