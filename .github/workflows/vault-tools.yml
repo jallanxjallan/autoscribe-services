@@ -1,0 +1,24 @@
+name: Vault tools CI
+
+on:
+  push:
+    branches:
+      - vault-tools
+  pull_request:
+    paths:
+      - "bins/vault-tools/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test -p vault-tools
+      - run: cargo clippy -p vault-tools --all-targets -- -D warnings
