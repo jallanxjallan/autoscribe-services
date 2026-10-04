@@ -8,6 +8,7 @@ members = [
   "bins/srv-writeback",
   "bins/srv-export",
   "bins/srv-plan-select",
+  "bins/vault-tools",
 ]
 
 [workspace.package]
