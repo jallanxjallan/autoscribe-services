@@ -534,6 +534,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "srv-context"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "srv-common",
+ "tempfile",
+]
+
+[[package]]
 name = "srv-export"
 version = "0.1.0"
 dependencies = [

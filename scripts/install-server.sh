@@ -12,7 +12,7 @@ fi
 SHA=$(git rev-parse HEAD)
 RELEASE="/opt/autoscribe/services/releases/$SHA"
 CURRENT="/opt/autoscribe/services/current"
-BINS=(srv-input srv-output srv-control-ingest srv-writeback srv-export srv-plan-select)
+BINS=(srv-input srv-output srv-control-ingest srv-context srv-writeback srv-export srv-plan-select)
 
 cargo build --release --workspace
 
@@ -23,6 +23,8 @@ done
 sudo install -m 0755 scripts/reset-control-db.sh "$RELEASE/bin/reset-control-db"
 sudo ln -sfn "$RELEASE" "$CURRENT.new"
 sudo mv -Tf "$CURRENT.new" "$CURRENT"
+
+"$CURRENT/bin/srv-context" init >/dev/null
 
 echo "Installed services commit $SHA"
 echo "Current: $CURRENT -> $RELEASE"

@@ -38,6 +38,8 @@ pub struct PathsPolicy {
     pub effects_db: PathBuf,
     #[serde(default = "default_control_db")]
     pub control_db: PathBuf,
+    #[serde(default = "default_context_db")]
+    pub context_db: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +94,10 @@ fn default_effects_db() -> PathBuf {
 
 fn default_control_db() -> PathBuf {
     PathBuf::from("/var/lib/autoscribe/control.sqlite")
+}
+
+fn default_context_db() -> PathBuf {
+    PathBuf::from("/var/lib/autoscribe/context.sqlite")
 }
 
 fn default_max_record_bytes() -> usize {

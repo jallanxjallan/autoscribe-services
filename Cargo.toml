@@ -5,6 +5,7 @@ members = [
   "bins/srv-input",
   "bins/srv-output",
   "bins/srv-control-ingest",
+  "bins/srv-context",
   "bins/srv-writeback",
   "bins/srv-export",
   "bins/srv-plan-select",

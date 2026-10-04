@@ -1,0 +1,16 @@
+[package]
+name = "srv-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+srv-common = { path = "../../crates/srv-common" }
+
+[dev-dependencies]
+tempfile.workspace = true

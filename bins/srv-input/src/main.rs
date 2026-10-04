@@ -2,12 +2,10 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use srv_common::{
-    canonical_json_bytes, load_policy, safe_identifier, sha256_hex, INPUT_SCHEMA,
-};
+use srv_common::{canonical_json_bytes, load_policy, safe_identifier, sha256_hex, INPUT_SCHEMA};
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -43,12 +41,34 @@ struct CanonicalInput {
     baggage: Value,
 }
 
+#[derive(Debug)]
+enum RoutedRecord {
+    Call(CanonicalInput),
+    Context(Value),
+}
+
+#[derive(Debug, Default)]
+struct TransportBatch {
+    calls: Vec<CanonicalInput>,
+    contexts: Vec<Value>,
+}
+
 fn rclone_binary() -> OsString {
     std::env::var_os("AUTOSCRIBE_RCLONE").unwrap_or_else(|| OsString::from("rclone"))
 }
 
 fn asc_binary() -> OsString {
     std::env::var_os("AUTOSCRIBE_ASC").unwrap_or_else(|| OsString::from("asc"))
+}
+
+fn context_binary() -> OsString {
+    if let Some(value) = std::env::var_os("AUTOSCRIBE_CONTEXT") {
+        return value;
+    }
+    std::env::current_exe()
+        .ok()
+        .map(|path| path.with_file_name("srv-context").into_os_string())
+        .unwrap_or_else(|| OsString::from("srv-context"))
 }
 
 fn command_output(program: OsString, args: &[&str], label: &str) -> Result<Vec<u8>> {
@@ -104,7 +124,10 @@ fn validate_text(content: &str, max_body_bytes: usize) -> Result<()> {
     }
     for ch in content.chars() {
         if ch == '\0' || (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t' | '\u{000C}')) {
-            bail!("content contains a non-text control character U+{:04X}", ch as u32);
+            bail!(
+                "content contains a non-text control character U+{:04X}",
+                ch as u32
+            );
         }
     }
     Ok(())
@@ -161,43 +184,78 @@ fn canonical_input(
     })
 }
 
+fn route_record(
+    transport_file: &str,
+    line_number: usize,
+    value: Value,
+    max_body_bytes: usize,
+) -> Result<RoutedRecord> {
+    let mut object = value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("line {line_number} must be a JSON object"))?;
+
+    let record_type = match object.remove("type") {
+        None => "call".to_string(),
+        Some(Value::String(value)) if !value.is_empty() => value,
+        Some(_) => bail!("line {line_number} type must be non-empty text"),
+    };
+
+    let value = Value::Object(object);
+    match record_type.as_str() {
+        "call" => Ok(RoutedRecord::Call(canonical_input(
+            transport_file,
+            line_number,
+            value,
+            max_body_bytes,
+        )?)),
+        "context" => {
+            let content = value
+                .get("content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("line {line_number} context content must be text")
+                })?;
+            validate_text(content, max_body_bytes)
+                .with_context(|| format!("line {line_number} context content rejected"))?;
+            Ok(RoutedRecord::Context(value))
+        }
+        other => bail!("line {line_number} has unsupported type {other:?}"),
+    }
+}
+
 fn parse_transport(
     transport_file: &str,
     bytes: &[u8],
     max_record_bytes: usize,
     max_body_bytes: usize,
-) -> Result<Vec<CanonicalInput>> {
+) -> Result<TransportBatch> {
     if bytes.len() > MAX_TRANSPORT_FILE_BYTES {
-        bail!(
-            "transport file exceeds {} bytes",
-            MAX_TRANSPORT_FILE_BYTES
-        );
+        bail!("transport file exceeds {} bytes", MAX_TRANSPORT_FILE_BYTES);
     }
     let text = std::str::from_utf8(bytes).context("transport file is not UTF-8 text")?;
-    let mut records = Vec::new();
+    let mut batch = TransportBatch::default();
 
     for (index, raw) in text.lines().enumerate() {
         let line_number = index + 1;
         if raw.trim().is_empty() {
             continue;
         }
-        if raw.as_bytes().len() > max_record_bytes {
+        if raw.len() > max_record_bytes {
             bail!("line {line_number} exceeds {max_record_bytes} bytes");
         }
         let value: Value = serde_json::from_str(raw)
             .with_context(|| format!("line {line_number} is not valid JSON"))?;
-        records.push(canonical_input(
-            transport_file,
-            line_number,
-            value,
-            max_body_bytes,
-        )?);
+        match route_record(transport_file, line_number, value, max_body_bytes)? {
+            RoutedRecord::Call(record) => batch.calls.push(record),
+            RoutedRecord::Context(record) => batch.contexts.push(record),
+        }
     }
 
-    if records.is_empty() {
+    if batch.calls.is_empty() && batch.contexts.is_empty() {
         bail!("transport file contains no NDJSON records");
     }
-    Ok(records)
+    Ok(batch)
 }
 
 fn enqueue_records(records: &[CanonicalInput]) -> Result<Vec<u8>> {
@@ -233,6 +291,43 @@ fn enqueue_records(records: &[CanonicalInput]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn store_context_records(records: &[Value], policy: &Path) -> Result<Vec<u8>> {
+    let mut child = Command::new(context_binary())
+        .arg("--policy")
+        .arg(policy)
+        .arg("put")
+        .arg("--origin")
+        .arg("upload")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to execute srv-context put")?;
+
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to open srv-context stdin"))?;
+        for record in records {
+            serde_json::to_writer(&mut stdin, record)?;
+            stdin.write_all(b"\n")?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for srv-context put")?;
+    if !output.status.success() {
+        bail!(
+            "srv-context put failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
 fn list_incoming() -> Result<Vec<String>> {
     let listing = rclone_output(
         &["lsf", "--files-only", DROPBOX_INCOMING],
@@ -253,12 +348,23 @@ fn process_file(
     name: &str,
     max_record_bytes: usize,
     max_body_bytes: usize,
+    policy: &Path,
 ) -> Result<usize> {
     safe_transport_name(name)?;
     let remote = format!("{DROPBOX_INCOMING}/{name}");
     let bytes = rclone_output(&["cat", &remote], "rclone cat incoming transport")?;
-    let records = parse_transport(name, &bytes, max_record_bytes, max_body_bytes)?;
-    let enqueue_output = enqueue_records(&records)?;
+    let batch = parse_transport(name, &bytes, max_record_bytes, max_body_bytes)?;
+
+    let context_output = if batch.contexts.is_empty() {
+        Vec::new()
+    } else {
+        store_context_records(&batch.contexts, policy)?
+    };
+    let enqueue_output = if batch.calls.is_empty() {
+        Vec::new()
+    } else {
+        enqueue_records(&batch.calls)?
+    };
 
     rclone_output(
         &["deletefile", &remote],
@@ -266,24 +372,29 @@ fn process_file(
     )?;
 
     let enqueue_text = String::from_utf8_lossy(&enqueue_output);
+    let context_text = String::from_utf8_lossy(&context_output);
+    let total = batch.calls.len() + batch.contexts.len();
     println!(
         "{}",
         json!({
             "event": "ingest_enqueued",
             "transport": name,
-            "records": records.len(),
+            "records": total,
+            "call_records": batch.calls.len(),
+            "context_records": batch.contexts.len(),
             "enqueue_results": enqueue_text.lines().filter(|line| !line.trim().is_empty()).count(),
+            "context_results": context_text.lines().filter(|line| !line.trim().is_empty()).count(),
         })
     );
-    Ok(records.len())
+    Ok(total)
 }
 
-fn poll_once(max_record_bytes: usize, max_body_bytes: usize) -> Result<()> {
+fn poll_once(max_record_bytes: usize, max_body_bytes: usize, policy: &Path) -> Result<()> {
     let names = list_incoming()?;
     let mut failures = Vec::new();
 
     for name in names {
-        if let Err(error) = process_file(&name, max_record_bytes, max_body_bytes) {
+        if let Err(error) = process_file(&name, max_record_bytes, max_body_bytes, policy) {
             eprintln!(
                 "{}",
                 json!({
@@ -314,6 +425,7 @@ fn main() -> Result<()> {
         let result = poll_once(
             policy.limits.max_record_bytes,
             policy.limits.max_body_bytes,
+            &args.policy,
         );
         if args.once {
             return result;
@@ -325,5 +437,50 @@ fn main() -> Result<()> {
             );
         }
         thread::sleep(Duration::from_secs_f64(args.poll_seconds));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_type_remains_a_call() {
+        let value = json!({
+            "plan": "pln_0123456789ABCDEF",
+            "content": "hello",
+            "slug": "source-one"
+        });
+        match route_record("test.ndjson", 1, value, 1024).unwrap() {
+            RoutedRecord::Call(record) => {
+                assert_eq!(record.content, "hello");
+                assert_eq!(record.baggage["slug"], "source-one");
+            }
+            RoutedRecord::Context(_) => panic!("call was routed as context"),
+        }
+    }
+
+    #[test]
+    fn context_type_does_not_require_a_plan() {
+        let value = json!({
+            "type": "context",
+            "project": "book-one",
+            "selector": "briefing",
+            "content": "project context"
+        });
+        match route_record("test.ndjson", 1, value, 1024).unwrap() {
+            RoutedRecord::Context(record) => {
+                assert_eq!(record["project"], "book-one");
+                assert_eq!(record["selector"], "briefing");
+                assert!(record.get("type").is_none());
+            }
+            RoutedRecord::Call(_) => panic!("context was routed as call"),
+        }
+    }
+
+    #[test]
+    fn unknown_record_type_is_rejected() {
+        let value = json!({"type": "other", "content": "hello"});
+        assert!(route_record("test.ndjson", 1, value, 1024).is_err());
     }
 }

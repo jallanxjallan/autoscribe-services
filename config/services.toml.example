@@ -14,6 +14,7 @@ file_roots = []
 effect_key_file = "/etc/autoscribe/effect.key"
 effects_db = "/var/lib/autoscribe/effects.sqlite"
 control_db = "/home/jeremy/Data/control.sql"
+context_db = "/var/lib/autoscribe/context.sqlite"
 
 [limits]
 max_record_bytes = 2097152

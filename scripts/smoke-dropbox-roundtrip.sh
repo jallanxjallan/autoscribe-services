@@ -45,6 +45,7 @@ file_roots = []
 effect_key_file = "$TMP/effect.key"
 effects_db = "$TMP/state/effects.sqlite"
 control_db = "$TMP/state/control.sqlite"
+context_db = "$TMP/state/context.sqlite"
 
 [limits]
 max_record_bytes = 2097152
@@ -169,15 +170,23 @@ export AUTOSCRIBE_WORKER_POLL_SECONDS=0.05
 export AUTOSCRIBE_RCLONE="$TMP/bin/rclone"
 export AUTOSCRIBE_FAKE_DROPBOX="$TMP/dropbox"
 export AUTOSCRIBE_ASC="$ASC"
+export AUTOSCRIBE_CONTEXT="$BIN/srv-context"
 
 python3 "$AUTOSCRIBE_ROOT/app/daemon/executord.py" >"$TMP/executord.log" 2>&1 &
 EXEC_PID=$!
 python3 "$AUTOSCRIBE_ROOT/app/daemon/workerd.py" >"$TMP/workerd.log" 2>&1 &
 WORK_PID=$!
 
-echo '[1/4] Ingress validates client NDJSON, strips content/plan, and preserves opaque baggage'
+echo '[1/4] Ingress routes context records to SQLite and call records to AutoScribe'
 python3 - <<PY > "$TMP/dropbox/incoming/smoke.ndjson"
 import hashlib, json
+print(json.dumps({
+    "type": "context",
+    "project": "smoke-project",
+    "source": "smoke-source",
+    "selector": "briefing",
+    "content": "smoke project briefing"
+}, separators=(",", ":")))
 content = "hello autoscribe"
 print(json.dumps({
     "plan": "pln_0123456789ABCDEF",
@@ -190,6 +199,16 @@ print(json.dumps({
 PY
 "$BIN/srv-input" --policy "$POLICY" --once
 [ ! -e "$TMP/dropbox/incoming/smoke.ndjson" ]
+CONTEXT_JSON=$("$BIN/srv-context" --policy "$POLICY" resolve \
+  --project smoke-project --source smoke-source --selector briefing)
+python3 - <<PY
+import json
+result = json.loads('''$CONTEXT_JSON''')
+assert result["schema"] == "autoscribe.context-resolution.v1"
+assert len(result["records"]) == 1
+assert result["records"][0]["content"] == "smoke project briefing"
+assert result["records"][0]["origin"] == "upload"
+PY
 
 echo '[2/4] AutoScribe executes the local Python step and produces a pending response'
 PENDING=
