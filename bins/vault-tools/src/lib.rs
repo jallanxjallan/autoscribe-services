@@ -1216,7 +1216,7 @@ mod tests {
         let changes = propagate_vault_to_master(&target, &source, false, false).unwrap();
 
         assert!(changes.iter().any(|change| {
-            change.path == PathBuf::from("config/plugins/example/data.json")
+            change.path == Path::new("config/plugins/example/data.json")
                 && change.kind == ChangeKind::Added
         }));
     }
