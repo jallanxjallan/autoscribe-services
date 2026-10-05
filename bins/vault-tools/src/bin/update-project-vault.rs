@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use vault_tools::{ensure_vault_root, print_changes, resolve_master, sync_master_to_vault};
 
 #[derive(Parser, Debug)]
-#[command(about = "Update a vault from the canonical Obsidian master")]
+#[command(about = "Update a vault from the canonical Obsidian source library")]
 struct Args {
     #[arg(long)]
     master: Option<PathBuf>,
 
-    /// Remove managed target files that no longer exist in the master.
+    /// Remove stale files only from explicitly managed editing trees.
     #[arg(long)]
     prune: bool,
 }
