@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -8,24 +8,34 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
-const MANAGED_FILES: &[&str] = &[
-    ".obsidian/app.json",
-    ".obsidian/appearance.json",
-    ".obsidian/core-plugins.json",
-    ".obsidian/community-plugins.json",
-    ".obsidian/hotkeys.json",
-    ".obsidian/templates.json",
+const ROOT_CONFIG_FILES: &[&str] = &[
+    "app.json",
+    "appearance.json",
+    "core-plugins.json",
+    "community-plugins.json",
+    "hotkeys.json",
+    "templates.json",
 ];
 
-const MANAGED_DIRS: &[&str] = &[
+const SOURCE_TREES: &[(&str, &str, bool)] = &[
+    ("config", ".obsidian", true),
+    ("plugins", ".obsidian/plugins", false),
+    ("snippets", ".obsidian/snippets", true),
+    ("themes", ".obsidian/themes", false),
+    ("tools", "_tools", true),
+    ("templates", "_templates", true),
+    ("scripts", "_scripts", true),
+    ("ui", "_ui", true),
+    ("views", "_views", true),
+];
+
+const PRUNABLE_TARGET_DIRS: &[&str] = &[
+    "_tools",
     "_templates",
     "_scripts",
     "_ui",
     "_views",
-    "_tools",
-    ".obsidian/plugins",
     ".obsidian/snippets",
-    ".obsidian/themes",
 ];
 
 const GITIGNORE_START: &str = "# >>> vault-tools managed ignores >>>";
@@ -51,6 +61,13 @@ pub struct Change {
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedFile {
+    source_rel: PathBuf,
+    target_rel: PathBuf,
+    reverse: bool,
+}
+
 #[derive(Debug)]
 pub struct InitReport {
     pub remote: PathBuf,
@@ -68,33 +85,51 @@ pub fn ensure_vault_root(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_source_root(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("vault source directory does not exist: {}", path.display());
+    }
+
+    let files = collect_source_files(path)?;
+    if files.is_empty() {
+        bail!(
+            "vault source contains no managed material: {} (expected config/, plugins/, tools/, templates/, scripts/, snippets/, themes/, ui/, views/, or supported root JSON files)",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 pub fn resolve_master(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        ensure_vault_root(&path)
+        ensure_source_root(&path)
             .with_context(|| format!("invalid --master path {}", path.display()))?;
         return Ok(path);
     }
 
-    if let Some(path) = env::var_os("OBSIDIAN_MASTER_VAULT").map(PathBuf::from) {
-        ensure_vault_root(&path)
-            .with_context(|| format!("invalid OBSIDIAN_MASTER_VAULT {}", path.display()))?;
-        return Ok(path);
+    for variable in ["OBSIDIAN_VAULT_SOURCE", "OBSIDIAN_MASTER_VAULT"] {
+        if let Some(path) = env::var_os(variable).map(PathBuf::from) {
+            ensure_source_root(&path)
+                .with_context(|| format!("invalid {variable} {}", path.display()))?;
+            return Ok(path);
+        }
     }
 
     let home = home_dir()?;
     let candidates = [
-        home.join("Studio/Obsidian"),
-        home.join("Work/Obsidian"),
+        home.join("Tools/vault"),
+        home.join("Work/client/obsidian"),
     ];
 
     for candidate in candidates {
-        if candidate.join(".obsidian").is_dir() {
+        if ensure_source_root(&candidate).is_ok() {
             return Ok(candidate);
         }
     }
 
     bail!(
-        "cannot find the master Obsidian vault; set OBSIDIAN_MASTER_VAULT or pass --master"
+        "cannot find the canonical Obsidian source library; expected ~/Tools/vault, or set OBSIDIAN_VAULT_SOURCE / pass --master"
     )
 }
 
@@ -161,50 +196,49 @@ pub fn snake_case_folder_name(path: &Path) -> Result<String> {
     Ok(out)
 }
 
-pub fn sync_master_to_vault(master: &Path, vault: &Path, prune: bool) -> Result<Vec<Change>> {
-    ensure_vault_root(master)?;
+pub fn sync_master_to_vault(source: &Path, vault: &Path, prune: bool) -> Result<Vec<Change>> {
+    ensure_source_root(source)?;
     ensure_vault_root(vault)?;
-    ensure_distinct(master, vault)?;
+    ensure_distinct(source, vault)?;
 
-    let source_files = collect_managed_files(master)?;
-    if source_files.is_empty() {
-        bail!(
-            "master vault contains no managed Obsidian configuration or editing assets: {}",
-            master.display()
-        );
-    }
-
+    let mappings = collect_source_files(source)?;
     let mut changes = Vec::new();
 
-    for rel in &source_files {
-        let source = master.join(rel);
-        let target = vault.join(rel);
+    for mapping in &mappings {
+        let from = source.join(&mapping.source_rel);
+        let to = vault.join(&mapping.target_rel);
 
-        if file_differs(&source, &target)? {
-            let kind = if target.exists() {
+        if file_differs(&from, &to)? {
+            let kind = if to.exists() {
                 ChangeKind::Updated
             } else {
                 ChangeKind::Added
             };
-            copy_file_atomic(&source, &target)?;
+            copy_file_atomic(&from, &to, vault)?;
             changes.push(Change {
                 kind,
-                path: rel.clone(),
+                path: mapping.target_rel.clone(),
             });
         }
     }
 
     if prune {
-        let target_files = collect_managed_files(vault)?;
-        for rel in target_files.difference(&source_files) {
-            let target = vault.join(rel);
-            ensure_safe_destination(vault, &target)?;
-            fs::remove_file(&target)
-                .with_context(|| format!("failed to remove {}", target.display()))?;
-            changes.push(Change {
-                kind: ChangeKind::Removed,
-                path: rel.clone(),
-            });
+        let managed_targets = mappings
+            .iter()
+            .map(|mapping| mapping.target_rel.clone())
+            .collect::<BTreeSet<_>>();
+
+        for rel in collect_prunable_target_files(vault)? {
+            if !managed_targets.contains(&rel) {
+                let target = vault.join(&rel);
+                ensure_safe_destination(vault, &target)?;
+                fs::remove_file(&target)
+                    .with_context(|| format!("failed to remove {}", target.display()))?;
+                changes.push(Change {
+                    kind: ChangeKind::Removed,
+                    path: rel,
+                });
+            }
         }
     }
 
@@ -212,33 +246,45 @@ pub fn sync_master_to_vault(master: &Path, vault: &Path, prune: bool) -> Result<
 }
 
 pub fn propagate_vault_to_master(
+    vault: &Path,
     source: &Path,
-    master: &Path,
     apply: bool,
     allow_sensitive: bool,
 ) -> Result<Vec<Change>> {
-    ensure_vault_root(source)?;
-    ensure_vault_root(master)?;
-    ensure_distinct(source, master)?;
+    ensure_vault_root(vault)?;
+    ensure_source_root(source)?;
+    ensure_distinct(vault, source)?;
 
     if apply {
-        ensure_git_root(master)?;
-        ensure_git_clean(master)?;
+        ensure_git_clean_for_path(source)?;
     }
 
-    let source_files = collect_managed_files(source)?;
+    let mappings = collect_source_files(source)?;
+    let mut reverse = BTreeMap::<PathBuf, PathBuf>::new();
+
+    for mapping in &mappings {
+        if mapping.reverse {
+            reverse.insert(mapping.target_rel.clone(), mapping.source_rel.clone());
+        }
+    }
+
+    add_new_reverse_candidates(vault, source, &mut reverse)?;
+
     let mut changes = Vec::new();
 
-    for rel in source_files {
-        let from = source.join(&rel);
-        let to = master.join(&rel);
+    for (target_rel, source_rel) in reverse {
+        let from = vault.join(&target_rel);
+        if !from.is_file() {
+            continue;
+        }
 
+        let to = source.join(&source_rel);
         if !file_differs(&from, &to)? {
             continue;
         }
 
         if !allow_sensitive {
-            ensure_no_sensitive_material(&from, &rel)?;
+            ensure_no_sensitive_material(&from, &target_rel)?;
         }
 
         changes.push(Change {
@@ -247,17 +293,16 @@ pub fn propagate_vault_to_master(
             } else {
                 ChangeKind::Added
             },
-            path: rel.clone(),
+            path: source_rel.clone(),
         });
 
         if apply {
-            copy_file_atomic(&from, &to)?;
+            copy_file_atomic(&from, &to, source)?;
         }
     }
 
     // Reverse propagation is deliberately additive/update-only. A project vault
-    // can never delete canonical master material. Deletions remain a conscious
-    // edit made in the master itself.
+    // can never delete canonical source material.
     Ok(changes)
 }
 
@@ -356,43 +401,105 @@ pub fn print_changes(label: &str, changes: &[Change]) {
     }
 }
 
-fn collect_managed_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    let mut files = BTreeSet::new();
+fn collect_source_files(source: &Path) -> Result<Vec<ManagedFile>> {
+    if !source.is_dir() {
+        return Ok(Vec::new());
+    }
 
-    for rel in MANAGED_FILES {
-        let path = root.join(rel);
-        if !path.exists() {
+    let mut by_target = BTreeMap::<PathBuf, ManagedFile>::new();
+
+    for name in ROOT_CONFIG_FILES {
+        let source_rel = PathBuf::from(name);
+        let path = source.join(&source_rel);
+        if path.exists() {
+            validate_source_file(&path)?;
+            let mapping = ManagedFile {
+                source_rel,
+                target_rel: PathBuf::from(".obsidian").join(name),
+                reverse: true,
+            };
+            insert_mapping(&mut by_target, mapping)?;
+        }
+    }
+
+    for (source_dir, target_dir, reverse_tree) in SOURCE_TREES {
+        let root = source.join(source_dir);
+        if !root.exists() {
             continue;
         }
-        let meta = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+        let meta = fs::symlink_metadata(&root)
+            .with_context(|| format!("failed to inspect {}", root.display()))?;
         if meta.file_type().is_symlink() {
-            bail!("managed path may not be a symlink: {}", path.display());
+            bail!("managed source directory may not be a symlink: {}", root.display());
         }
-        if !meta.is_file() {
-            bail!("managed path is not a file: {}", path.display());
+        if !meta.is_dir() {
+            bail!("managed source path is not a directory: {}", root.display());
         }
-        files.insert(PathBuf::from(rel));
+
+        let files = collect_relative_files(&root)?;
+        for rel in files {
+            if is_auxiliary_source_file(&rel) {
+                continue;
+            }
+
+            let target_rel = PathBuf::from(target_dir).join(&rel);
+            if is_forbidden_target_relative(&target_rel) {
+                continue;
+            }
+
+            let reverse = *reverse_tree
+                || (*source_dir == "plugins"
+                    && rel.file_name() == Some(OsStr::new("data.json")));
+
+            let mapping = ManagedFile {
+                source_rel: PathBuf::from(source_dir).join(&rel),
+                target_rel,
+                reverse,
+            };
+            insert_mapping(&mut by_target, mapping)?;
+        }
     }
 
-    for rel in MANAGED_DIRS {
-        let path = root.join(rel);
-        if !path.exists() {
-            continue;
-        }
-        collect_directory(root, &path, &mut files)?;
-    }
+    Ok(by_target.into_values().collect())
+}
 
+fn insert_mapping(
+    mappings: &mut BTreeMap<PathBuf, ManagedFile>,
+    mapping: ManagedFile,
+) -> Result<()> {
+    if let Some(previous) = mappings.get(&mapping.target_rel) {
+        bail!(
+            "two source files map to the same vault path {}: {} and {}",
+            mapping.target_rel.display(),
+            previous.source_rel.display(),
+            mapping.source_rel.display()
+        );
+    }
+    mappings.insert(mapping.target_rel.clone(), mapping);
+    Ok(())
+}
+
+fn validate_source_file(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!("managed source file may not be a symlink: {}", path.display());
+    }
+    if !meta.is_file() {
+        bail!("managed source path is not a file: {}", path.display());
+    }
+    Ok(())
+}
+
+fn collect_relative_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_relative_files_inner(root, root, &mut files)?;
+    files.sort();
     Ok(files)
 }
 
-fn collect_directory(root: &Path, dir: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
-    let meta = fs::symlink_metadata(dir)
-        .with_context(|| format!("failed to inspect {}", dir.display()))?;
-    if meta.file_type().is_symlink() {
-        bail!("managed directory may not be a symlink: {}", dir.display());
-    }
-
+fn collect_relative_files_inner(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries = fs::read_dir(dir)
         .with_context(|| format!("failed to read {}", dir.display()))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -400,45 +507,150 @@ fn collect_directory(root: &Path, dir: &Path, files: &mut BTreeSet<PathBuf>) -> 
 
     for entry in entries {
         let path = entry.path();
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+        if meta.file_type().is_symlink() {
+            bail!("managed source path may not be a symlink: {}", path.display());
+        }
+
         let rel = path
             .strip_prefix(root)
             .with_context(|| format!("{} escaped {}", path.display(), root.display()))?
             .to_path_buf();
 
-        if is_forbidden_relative(&rel) {
+        if has_forbidden_component(&rel) {
             continue;
         }
 
-        let meta = fs::symlink_metadata(&path)
-            .with_context(|| format!("failed to inspect {}", path.display()))?;
-
-        if meta.file_type().is_symlink() {
-            bail!("managed path may not be a symlink: {}", path.display());
-        }
-
         if meta.is_dir() {
-            collect_directory(root, &path, files)?;
+            collect_relative_files_inner(root, &path, files)?;
         } else if meta.is_file() {
-            files.insert(rel);
+            files.push(rel);
         }
     }
 
     Ok(())
 }
 
-fn is_forbidden_relative(rel: &Path) -> bool {
+fn collect_prunable_target_files(vault: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut result = BTreeSet::new();
+    for target_dir in PRUNABLE_TARGET_DIRS {
+        let root = vault.join(target_dir);
+        if !root.is_dir() {
+            continue;
+        }
+        for rel in collect_relative_files(&root)? {
+            let target_rel = PathBuf::from(target_dir).join(rel);
+            if !is_forbidden_target_relative(&target_rel) {
+                result.insert(target_rel);
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn add_new_reverse_candidates(
+    vault: &Path,
+    source: &Path,
+    reverse: &mut BTreeMap<PathBuf, PathBuf>,
+) -> Result<()> {
+    // _tools and the other explicitly-managed editing trees are safe places for
+    // new reusable files created inside a project vault.
+    for (source_dir, target_dir, reverse_tree) in SOURCE_TREES {
+        if !*reverse_tree || *source_dir == "config" {
+            continue;
+        }
+
+        let target_root = vault.join(target_dir);
+        if !target_root.is_dir() {
+            continue;
+        }
+
+        for rel in collect_relative_files(&target_root)? {
+            let target_rel = PathBuf::from(target_dir).join(&rel);
+            if is_forbidden_target_relative(&target_rel) {
+                continue;
+            }
+            reverse
+                .entry(target_rel)
+                .or_insert_with(|| PathBuf::from(source_dir).join(rel));
+        }
+    }
+
+    // Supported top-level Obsidian JSON configuration is captured into config/
+    // unless an existing source file already owns the target path.
+    for name in ROOT_CONFIG_FILES {
+        let target_rel = PathBuf::from(".obsidian").join(name);
+        if reverse.contains_key(&target_rel) {
+            continue;
+        }
+        if vault.join(&target_rel).is_file() {
+            reverse.insert(target_rel, PathBuf::from("config").join(name));
+        }
+    }
+
+    // Plugin executables are installation artifacts and never flow back from a
+    // vault. Plugin data.json is reusable configuration and may be captured for
+    // plugins known to the source library.
+    let plugin_root = vault.join(".obsidian/plugins");
+    if plugin_root.is_dir() {
+        let mut entries = fs::read_dir(&plugin_root)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+
+        for entry in entries {
+            let plugin_id = entry.file_name();
+            let Some(plugin_id_str) = plugin_id.to_str() else {
+                continue;
+            };
+            let target_rel = PathBuf::from(".obsidian/plugins")
+                .join(plugin_id_str)
+                .join("data.json");
+
+            if reverse.contains_key(&target_rel) || !vault.join(&target_rel).is_file() {
+                continue;
+            }
+
+            let known_plugin = source.join("plugins").join(plugin_id_str).is_dir()
+                || source
+                    .join("config/plugins")
+                    .join(plugin_id_str)
+                    .exists();
+
+            if known_plugin {
+                reverse.insert(
+                    target_rel,
+                    PathBuf::from("config/plugins")
+                        .join(plugin_id_str)
+                        .join("data.json"),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_auxiliary_source_file(rel: &Path) -> bool {
+    matches!(
+        rel.file_name().and_then(OsStr::to_str),
+        Some("README.md" | "AGENTS.md")
+    )
+}
+
+fn is_forbidden_target_relative(rel: &Path) -> bool {
     let normalized = slash_path(rel);
-    if normalized == ".DS_Store" || normalized.ends_with("/.DS_Store") {
-        return true;
-    }
 
-    if normalized.starts_with(".obsidian/workspace")
-        || normalized.starts_with(".obsidian/cache/")
+    normalized == ".DS_Store"
+        || normalized.ends_with("/.DS_Store")
+        || normalized.starts_with(".obsidian/workspace")
         || normalized == ".obsidian/cache"
-    {
-        return true;
-    }
+        || normalized.starts_with(".obsidian/cache/")
+        || has_forbidden_component(rel)
+}
 
+fn has_forbidden_component(rel: &Path) -> bool {
     rel.components().any(|component| {
         matches!(
             component,
@@ -453,7 +665,7 @@ fn is_forbidden_relative(rel: &Path) -> bool {
 
 fn ensure_distinct(a: &Path, b: &Path) -> Result<()> {
     if same_existing_path(a, b)? {
-        bail!("source and destination vault are the same directory");
+        bail!("source library and destination vault are the same directory");
     }
     Ok(())
 }
@@ -471,16 +683,21 @@ fn file_differs(source: &Path, target: &Path) -> Result<bool> {
         return Ok(true);
     }
 
+    let source_meta = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect {}", source.display()))?;
+    if source_meta.file_type().is_symlink() || !source_meta.is_file() {
+        bail!("managed source is not a regular file: {}", source.display());
+    }
+
     let target_meta = fs::symlink_metadata(target)
         .with_context(|| format!("failed to inspect {}", target.display()))?;
     if target_meta.file_type().is_symlink() {
-        bail!("refusing to overwrite symlink {}", target.display());
+        bail!("refusing to read or overwrite symlink {}", target.display());
     }
     if !target_meta.is_file() {
-        bail!("refusing to overwrite non-file {}", target.display());
+        bail!("refusing to read or overwrite non-file {}", target.display());
     }
 
-    let source_meta = fs::metadata(source)?;
     if source_meta.len() != target_meta.len() {
         return Ok(true);
     }
@@ -488,13 +705,16 @@ fn file_differs(source: &Path, target: &Path) -> Result<bool> {
     Ok(fs::read(source)? != fs::read(target)?)
 }
 
-fn copy_file_atomic(source: &Path, target: &Path) -> Result<()> {
+fn copy_file_atomic(source: &Path, target: &Path, destination_root: &Path) -> Result<()> {
+    ensure_safe_destination(destination_root, target)?;
+
     let parent = target
         .parent()
         .context("managed target has no parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
-    ensure_safe_destination(parent, target)?;
+
+    ensure_safe_destination(destination_root, target)?;
 
     let tmp = parent.join(format!(".vault-tools.{}.tmp", std::process::id()));
     if tmp.exists() {
@@ -524,12 +744,48 @@ fn copy_file_atomic(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ensure_safe_destination(_root: &Path, target: &Path) -> Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(target) {
-        if meta.file_type().is_symlink() {
-            bail!("refusing to write through symlink {}", target.display());
+fn ensure_safe_destination(root: &Path, target: &Path) -> Result<()> {
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to resolve destination root {}", root.display()))?;
+
+    let relative = target
+        .strip_prefix(&root)
+        .or_else(|_| {
+            // target may not exist yet, while callers supplied a non-canonical
+            // spelling of root. Retry with the original path relationship.
+            target.strip_prefix(root.as_path())
+        })
+        .with_context(|| format!("target escaped destination root: {}", target.display()))?;
+
+    let mut current = root;
+    let components = relative.components().collect::<Vec<_>>();
+
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(part) = component else {
+            bail!("unsafe destination path: {}", target.display());
+        };
+
+        current.push(part);
+
+        if index + 1 == components.len() {
+            if let Ok(meta) = fs::symlink_metadata(&current) {
+                if meta.file_type().is_symlink() {
+                    bail!("refusing to write through symlink {}", current.display());
+                }
+            }
+            break;
+        }
+
+        if let Ok(meta) = fs::symlink_metadata(&current) {
+            if meta.file_type().is_symlink() {
+                bail!("refusing to traverse symlink {}", current.display());
+            }
+            if !meta.is_dir() {
+                bail!("destination parent is not a directory: {}", current.display());
+            }
         }
     }
+
     Ok(())
 }
 
@@ -541,8 +797,7 @@ fn ensure_no_sensitive_material(path: &Path, rel: &Path) -> Result<()> {
         if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
             if let Some(key) = find_sensitive_json_key(&value) {
                 bail!(
-                    "refusing to propagate {}: JSON key '{}' appears to contain credentials; \
-                     move the secret out of the vault or re-run with --allow-sensitive",
+                    "refusing to propagate {}: JSON key '{}' appears to contain credentials; move the secret out of the vault or re-run with --allow-sensitive",
                     rel.display(),
                     key
                 );
@@ -562,8 +817,7 @@ fn ensure_no_sensitive_material(path: &Path, rel: &Path) -> Result<()> {
         for marker in MARKERS {
             if text.contains(marker) {
                 bail!(
-                    "refusing to propagate {}: content resembles a credential ('{}'); \
-                     re-run with --allow-sensitive only if this is intentional",
+                    "refusing to propagate {}: content resembles a credential ('{}'); re-run with --allow-sensitive only if this is intentional",
                     rel.display(),
                     marker
                 );
@@ -577,7 +831,7 @@ fn ensure_no_sensitive_material(path: &Path, rel: &Path) -> Result<()> {
 fn is_text_config(path: &Path) -> bool {
     matches!(
         path.extension().and_then(OsStr::to_str),
-        Some("json" | "yaml" | "yml" | "toml" | "txt" | "md")
+        Some("json" | "yaml" | "yml" | "toml" | "txt" | "md" | "js" | "css")
     )
 }
 
@@ -652,33 +906,32 @@ fn git_root(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(root.trim())))
 }
 
-fn ensure_git_root(path: &Path) -> Result<()> {
+fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
     let root = git_root(path)?
-        .with_context(|| format!("master vault is not a Git repository: {}", path.display()))?;
-    if !same_existing_path(&root, path)? {
-        bail!(
-            "master vault must be the root of its Git repository; repository root is {}",
-            root.display()
-        );
-    }
-    Ok(())
-}
+        .with_context(|| format!("vault source is not inside a Git repository: {}", path.display()))?;
 
-fn ensure_git_clean(path: &Path) -> Result<()> {
+    let canonical_root = fs::canonicalize(&root)?;
+    let canonical_path = fs::canonicalize(path)?;
+    let relative = canonical_path
+        .strip_prefix(&canonical_root)
+        .with_context(|| format!("{} is outside repository {}", path.display(), root.display()))?;
+
     let output = Command::new("git")
         .arg("-C")
-        .arg(path)
-        .args(["status", "--porcelain"])
+        .arg(&root)
+        .args(["status", "--porcelain", "--untracked-files=all", "--"])
+        .arg(relative)
         .output()
-        .context("failed to inspect master Git status")?;
+        .context("failed to inspect vault source Git status")?;
 
     if !output.status.success() {
-        bail!("failed to inspect master Git status");
+        bail!("failed to inspect vault source Git status");
     }
 
     if !output.stdout.is_empty() {
         bail!(
-            "master vault has uncommitted changes; commit or discard them before propagating into it"
+            "vault source has uncommitted changes under {}; commit or discard them before applying reverse propagation",
+            path.display()
         );
     }
     Ok(())
@@ -853,6 +1106,15 @@ mod tests {
         fs::create_dir_all(root.join(".obsidian")).unwrap();
     }
 
+    fn make_source(root: &Path) {
+        fs::create_dir_all(root.join("plugins/example")).unwrap();
+        fs::create_dir_all(root.join("tools/templates")).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("plugins/example/main.js"), b"plugin").unwrap();
+        fs::write(root.join("tools/templates/article.md"), b"template").unwrap();
+        fs::write(root.join("config/hotkeys.json"), b"{\"x\":1}").unwrap();
+    }
+
     #[test]
     fn folder_name_becomes_snake_case() {
         assert_eq!(
@@ -866,67 +1128,130 @@ mod tests {
     }
 
     #[test]
-    fn sync_updates_managed_files_but_preserves_workspace() {
+    fn source_library_does_not_need_obsidian_directory() {
         let temp = tempdir().unwrap();
-        let master = temp.path().join("master");
+        let source = temp.path().join("source");
         let target = temp.path().join("target");
-        make_vault(&master);
+        make_source(&source);
         make_vault(&target);
 
-        fs::write(master.join(".obsidian/hotkeys.json"), b"{\"x\":1}").unwrap();
-        fs::write(master.join(".obsidian/workspace.json"), b"master").unwrap();
-        fs::write(target.join(".obsidian/hotkeys.json"), b"{\"x\":0}").unwrap();
-        fs::write(target.join(".obsidian/workspace.json"), b"target").unwrap();
-
-        let changes = sync_master_to_vault(&master, &target, false).unwrap();
+        let changes = sync_master_to_vault(&source, &target, false).unwrap();
 
         assert_eq!(
             fs::read(target.join(".obsidian/hotkeys.json")).unwrap(),
             b"{\"x\":1}"
         );
         assert_eq!(
-            fs::read(target.join(".obsidian/workspace.json")).unwrap(),
-            b"target"
+            fs::read(target.join(".obsidian/plugins/example/main.js")).unwrap(),
+            b"plugin"
         );
-        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            fs::read(target.join("_tools/templates/article.md")).unwrap(),
+            b"template"
+        );
+        assert_eq!(changes.len(), 3);
     }
 
     #[test]
-    fn reverse_sync_never_touches_notes() {
+    fn source_workspace_state_is_never_copied() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
-        let master = temp.path().join("master");
-        make_vault(&source);
-        make_vault(&master);
+        let target = temp.path().join("target");
+        make_source(&source);
+        make_vault(&target);
 
-        fs::write(source.join("chapter.md"), b"content").unwrap();
-        fs::create_dir_all(source.join("_templates")).unwrap();
-        fs::write(source.join("_templates/article.md"), b"template").unwrap();
+        fs::write(source.join("config/workspace.json"), b"source").unwrap();
+        fs::write(target.join(".obsidian/workspace.json"), b"target").unwrap();
 
-        let changes = propagate_vault_to_master(&source, &master, false, false).unwrap();
+        sync_master_to_vault(&source, &target, false).unwrap();
 
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].path, PathBuf::from("_templates/article.md"));
-        assert!(!master.join("chapter.md").exists());
+        assert_eq!(
+            fs::read(target.join(".obsidian/workspace.json")).unwrap(),
+            b"target"
+        );
+    }
+
+    #[test]
+    fn reverse_sync_updates_config_and_tools_but_not_plugin_binary() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        make_source(&source);
+        make_vault(&target);
+        sync_master_to_vault(&source, &target, false).unwrap();
+
+        fs::write(target.join(".obsidian/hotkeys.json"), b"{\"x\":2}").unwrap();
+        fs::write(target.join(".obsidian/plugins/example/main.js"), b"changed plugin").unwrap();
+        fs::write(target.join("_tools/templates/article.md"), b"changed template").unwrap();
+        fs::write(target.join("chapter.md"), b"content").unwrap();
+
+        let changes = propagate_vault_to_master(&target, &source, false, false).unwrap();
+
+        let paths = changes
+            .iter()
+            .map(|change| slash_path(&change.path))
+            .collect::<BTreeSet<_>>();
+
+        assert!(paths.contains("config/hotkeys.json"));
+        assert!(paths.contains("tools/templates/article.md"));
+        assert!(!paths.contains("plugins/example/main.js"));
+        assert!(!paths.contains("chapter.md"));
+    }
+
+    #[test]
+    fn reverse_sync_can_add_plugin_data_for_known_plugin() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        make_source(&source);
+        make_vault(&target);
+        sync_master_to_vault(&source, &target, false).unwrap();
+
+        fs::write(
+            target.join(".obsidian/plugins/example/data.json"),
+            br#"{"setting":true}"#,
+        )
+        .unwrap();
+
+        let changes = propagate_vault_to_master(&target, &source, false, false).unwrap();
+
+        assert!(changes.iter().any(|change| {
+            change.path == Path::new("config/plugins/example/data.json")
+                && change.kind == ChangeKind::Added
+        }));
     }
 
     #[test]
     fn reverse_sync_rejects_nonempty_secret_fields() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
-        let master = temp.path().join("master");
-        make_vault(&source);
-        make_vault(&master);
+        let target = temp.path().join("target");
+        make_source(&source);
+        make_vault(&target);
+        sync_master_to_vault(&source, &target, false).unwrap();
 
-        fs::create_dir_all(source.join(".obsidian/plugins/example")).unwrap();
         fs::write(
-            source.join(".obsidian/plugins/example/data.json"),
+            target.join(".obsidian/plugins/example/data.json"),
             br#"{"apiKey":"do-not-copy"}"#,
         )
         .unwrap();
 
         let error =
-            propagate_vault_to_master(&source, &master, false, false).unwrap_err();
+            propagate_vault_to_master(&target, &source, false, false).unwrap_err();
         assert!(error.to_string().contains("apiKey"));
+    }
+
+    #[test]
+    fn auxiliary_readmes_are_not_materialized() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        make_source(&source);
+        make_vault(&target);
+
+        fs::write(source.join("tools/templates/README.md"), b"docs").unwrap();
+        sync_master_to_vault(&source, &target, false).unwrap();
+
+        assert!(!target.join("_tools/templates/README.md").exists());
     }
 }

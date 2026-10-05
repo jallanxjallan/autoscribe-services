@@ -6,7 +6,7 @@ use vault_tools::{
 };
 
 #[derive(Parser, Debug)]
-#[command(about = "Review or propagate managed vault configuration back to the master vault")]
+#[command(about = "Review or propagate reusable vault configuration back to the canonical source library")]
 struct Args {
     #[arg(long)]
     master: Option<PathBuf>,
