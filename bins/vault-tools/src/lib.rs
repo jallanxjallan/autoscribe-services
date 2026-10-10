@@ -117,10 +117,7 @@ pub fn resolve_master(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
 
     let home = home_dir()?;
-    let candidates = [
-        home.join("Tools/vault"),
-        home.join("Work/client/obsidian"),
-    ];
+    let candidates = [home.join(".config/obsidian-vault")];
 
     for candidate in candidates {
         if ensure_source_root(&candidate).is_ok() {
@@ -129,7 +126,7 @@ pub fn resolve_master(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
 
     bail!(
-        "cannot find the canonical Obsidian source library; expected ~/Tools/vault, or set OBSIDIAN_VAULT_SOURCE / pass --master"
+        "cannot find the canonical Obsidian source library; expected ~/.config/obsidian-vault, or set OBSIDIAN_VAULT_SOURCE / pass --master"
     )
 }
 
@@ -202,6 +199,7 @@ pub fn sync_master_to_vault(source: &Path, vault: &Path, prune: bool) -> Result<
     ensure_distinct(source, vault)?;
 
     let mappings = collect_source_files(source)?;
+    validate_installation_source(source, &mappings)?;
     let mut changes = Vec::new();
 
     for mapping in &mappings {
@@ -310,7 +308,10 @@ pub fn initialize_backup_repo(vault: &Path, repos_root: &Path) -> Result<InitRep
     ensure_vault_root(vault)?;
 
     if !repos_root.is_dir() {
-        bail!("Dropbox repos root does not exist: {}", repos_root.display());
+        bail!(
+            "Dropbox repos root does not exist: {}",
+            repos_root.display()
+        );
     }
 
     let repo_name = format!("{}.git", snake_case_folder_name(vault)?);
@@ -350,7 +351,7 @@ pub fn initialize_backup_repo(vault: &Path, repos_root: &Path) -> Result<InitRep
         ensure_bare_repo(&remote)?;
         false
     } else {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("init")
             .arg("--bare")
             .arg(format!("--initial-branch={branch}"))
@@ -431,7 +432,10 @@ fn collect_source_files(source: &Path) -> Result<Vec<ManagedFile>> {
         let meta = fs::symlink_metadata(&root)
             .with_context(|| format!("failed to inspect {}", root.display()))?;
         if meta.file_type().is_symlink() {
-            bail!("managed source directory may not be a symlink: {}", root.display());
+            bail!(
+                "managed source directory may not be a symlink: {}",
+                root.display()
+            );
         }
         if !meta.is_dir() {
             bail!("managed source path is not a directory: {}", root.display());
@@ -449,8 +453,7 @@ fn collect_source_files(source: &Path) -> Result<Vec<ManagedFile>> {
             }
 
             let reverse = *reverse_tree
-                || (*source_dir == "plugins"
-                    && rel.file_name() == Some(OsStr::new("data.json")));
+                || (*source_dir == "plugins" && rel.file_name() == Some(OsStr::new("data.json")));
 
             let mapping = ManagedFile {
                 source_rel: PathBuf::from(source_dir).join(&rel),
@@ -462,6 +465,43 @@ fn collect_source_files(source: &Path) -> Result<Vec<ManagedFile>> {
     }
 
     Ok(by_target.into_values().collect())
+}
+
+// A partially packaged source library must fail before changing the vault.
+fn validate_installation_source(source: &Path, mappings: &[ManagedFile]) -> Result<()> {
+    let read_json = |target: &str| -> Result<Value> {
+        let mapping = mappings.iter().find(|m| m.target_rel == Path::new(target))
+            .with_context(|| format!("incomplete vault template: missing {target}; restore canonical config/ and plugins/"))?;
+        let path = source.join(&mapping.source_rel);
+        serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid template JSON: {}", path.display()))
+    };
+    if !read_json(".obsidian/hotkeys.json")?.is_object() {
+        bail!("template hotkeys.json must be an object");
+    }
+    let enabled = read_json(".obsidian/community-plugins.json")?;
+    let enabled = enabled
+        .as_array()
+        .context("template community-plugins.json must be an array")?;
+    for id in enabled {
+        let id = id.as_str().context("template plugin ID must be a string")?;
+        if id.is_empty()
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            bail!("unsafe template plugin ID: {id}");
+        }
+        let manifest = read_json(&format!(".obsidian/plugins/{id}/manifest.json"))?;
+        if manifest["id"].as_str() != Some(id) {
+            bail!("template plugin manifest ID mismatch: {id}");
+        }
+        let target = PathBuf::from(format!(".obsidian/plugins/{id}/main.js"));
+        if !mappings.iter().any(|m| m.target_rel == target) {
+            bail!("incomplete vault template: missing plugin executable for {id}");
+        }
+    }
+    Ok(())
 }
 
 fn insert_mapping(
@@ -484,7 +524,10 @@ fn validate_source_file(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if meta.file_type().is_symlink() {
-        bail!("managed source file may not be a symlink: {}", path.display());
+        bail!(
+            "managed source file may not be a symlink: {}",
+            path.display()
+        );
     }
     if !meta.is_file() {
         bail!("managed source path is not a file: {}", path.display());
@@ -511,7 +554,10 @@ fn collect_relative_files_inner(root: &Path, dir: &Path, files: &mut Vec<PathBuf
             .with_context(|| format!("failed to inspect {}", path.display()))?;
 
         if meta.file_type().is_symlink() {
-            bail!("managed source path may not be a symlink: {}", path.display());
+            bail!(
+                "managed source path may not be a symlink: {}",
+                path.display()
+            );
         }
 
         let rel = path
@@ -595,8 +641,8 @@ fn add_new_reverse_candidates(
     // plugins known to the source library.
     let plugin_root = vault.join(".obsidian/plugins");
     if plugin_root.is_dir() {
-        let mut entries = fs::read_dir(&plugin_root)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut entries =
+            fs::read_dir(&plugin_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
         entries.sort_by_key(|entry| entry.file_name());
 
         for entry in entries {
@@ -613,10 +659,7 @@ fn add_new_reverse_candidates(
             }
 
             let known_plugin = source.join("plugins").join(plugin_id_str).is_dir()
-                || source
-                    .join("config/plugins")
-                    .join(plugin_id_str)
-                    .exists();
+                || source.join("config/plugins").join(plugin_id_str).exists();
 
             if known_plugin {
                 reverse.insert(
@@ -671,10 +714,8 @@ fn ensure_distinct(a: &Path, b: &Path) -> Result<()> {
 }
 
 fn same_existing_path(a: &Path, b: &Path) -> Result<bool> {
-    let a = fs::canonicalize(a)
-        .with_context(|| format!("failed to resolve {}", a.display()))?;
-    let b = fs::canonicalize(b)
-        .with_context(|| format!("failed to resolve {}", b.display()))?;
+    let a = fs::canonicalize(a).with_context(|| format!("failed to resolve {}", a.display()))?;
+    let b = fs::canonicalize(b).with_context(|| format!("failed to resolve {}", b.display()))?;
     Ok(a == b)
 }
 
@@ -695,7 +736,10 @@ fn file_differs(source: &Path, target: &Path) -> Result<bool> {
         bail!("refusing to read or overwrite symlink {}", target.display());
     }
     if !target_meta.is_file() {
-        bail!("refusing to read or overwrite non-file {}", target.display());
+        bail!(
+            "refusing to read or overwrite non-file {}",
+            target.display()
+        );
     }
 
     if source_meta.len() != target_meta.len() {
@@ -711,8 +755,7 @@ fn copy_file_atomic(source: &Path, target: &Path, destination_root: &Path) -> Re
     let parent = target
         .parent()
         .context("managed target has no parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
 
     ensure_safe_destination(destination_root, target)?;
 
@@ -781,7 +824,10 @@ fn ensure_safe_destination(root: &Path, target: &Path) -> Result<()> {
                 bail!("refusing to traverse symlink {}", current.display());
             }
             if !meta.is_dir() {
-                bail!("destination parent is not a directory: {}", current.display());
+                bail!(
+                    "destination parent is not a directory: {}",
+                    current.display()
+                );
             }
         }
     }
@@ -790,8 +836,7 @@ fn ensure_safe_destination(root: &Path, target: &Path) -> Result<()> {
 }
 
 fn ensure_no_sensitive_material(path: &Path, rel: &Path) -> Result<()> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("failed to inspect {}", path.display()))?;
 
     if rel.extension().and_then(OsStr::to_str) == Some("json") {
         if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
@@ -890,7 +935,7 @@ fn value_has_material(value: &Value) -> bool {
 }
 
 fn git_root(path: &Path) -> Result<Option<PathBuf>> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--show-toplevel"])
@@ -901,26 +946,40 @@ fn git_root(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let root = String::from_utf8(output.stdout)
-        .context("git returned a non-UTF-8 repository path")?;
+    let root =
+        String::from_utf8(output.stdout).context("git returned a non-UTF-8 repository path")?;
     Ok(Some(PathBuf::from(root.trim())))
 }
 
 fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
-    let root = git_root(path)?
-        .with_context(|| format!("vault source is not inside a Git repository: {}", path.display()))?;
+    let root = git_root(path)?.with_context(|| {
+        format!(
+            "vault source is not inside a Git repository: {}",
+            path.display()
+        )
+    })?;
 
     let canonical_root = fs::canonicalize(&root)?;
     let canonical_path = fs::canonicalize(path)?;
     let relative = canonical_path
         .strip_prefix(&canonical_root)
-        .with_context(|| format!("{} is outside repository {}", path.display(), root.display()))?;
+        .with_context(|| {
+            format!(
+                "{} is outside repository {}",
+                path.display(),
+                root.display()
+            )
+        })?;
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(&root)
         .args(["status", "--porcelain", "--untracked-files=all", "--"])
-        .arg(relative)
+        .arg(if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        })
         .output()
         .context("failed to inspect vault source Git status")?;
 
@@ -938,20 +997,23 @@ fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
 }
 
 fn ensure_bare_repo(path: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-bare-repository"])
         .output()
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != "true" {
-        bail!("existing backup path is not a bare Git repository: {}", path.display());
+        bail!(
+            "existing backup path is not a bare Git repository: {}",
+            path.display()
+        );
     }
     Ok(())
 }
 
 fn ensure_origin(vault: &Path, remote: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(vault)
         .args(["remote", "get-url", "origin"])
@@ -959,8 +1021,7 @@ fn ensure_origin(vault: &Path, remote: &Path) -> Result<()> {
         .context("failed to inspect Git origin")?;
 
     if output.status.success() {
-        let existing = String::from_utf8(output.stdout)
-            .context("Git origin is not valid UTF-8")?;
+        let existing = String::from_utf8(output.stdout).context("Git origin is not valid UTF-8")?;
         let existing = PathBuf::from(existing.trim());
         if existing.exists() && remote.exists() && same_existing_path(&existing, remote)? {
             return Ok(());
@@ -975,7 +1036,7 @@ fn ensure_origin(vault: &Path, remote: &Path) -> Result<()> {
         );
     }
 
-    let status = Command::new("git")
+    let status = git_command()
         .arg("-C")
         .arg(vault)
         .args(["remote", "add", "origin"])
@@ -991,8 +1052,7 @@ fn ensure_origin(vault: &Path, remote: &Path) -> Result<()> {
 fn write_managed_gitignore(vault: &Path) -> Result<()> {
     let path = vault.join(".gitignore");
     let mut content = if path.exists() {
-        fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?
     } else {
         String::new()
     };
@@ -1018,14 +1078,14 @@ fn write_managed_gitignore(vault: &Path) -> Result<()> {
         content.push('\n');
     }
 
-    let mut file = fs::File::create(&path)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    let mut file =
+        fs::File::create(&path).with_context(|| format!("failed to write {}", path.display()))?;
     file.write_all(content.as_bytes())?;
     Ok(())
 }
 
 fn current_branch(vault: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(vault)
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -1038,7 +1098,7 @@ fn current_branch(vault: &Path) -> Result<String> {
 }
 
 fn has_head(vault: &Path) -> Result<bool> {
-    Ok(Command::new("git")
+    Ok(git_command()
         .arg("-C")
         .arg(vault)
         .args(["rev-parse", "--verify", "HEAD"])
@@ -1048,7 +1108,7 @@ fn has_head(vault: &Path) -> Result<bool> {
 }
 
 fn has_staged_changes(vault: &Path) -> Result<bool> {
-    let status = Command::new("git")
+    let status = git_command()
         .arg("-C")
         .arg(vault)
         .args(["diff", "--cached", "--quiet"])
@@ -1068,7 +1128,7 @@ fn push_current_branch(vault: &Path) -> Result<()> {
 }
 
 fn run_git(vault: &Path, args: &[&str]) -> Result<Output> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(vault)
         .args(args)
@@ -1113,6 +1173,16 @@ mod tests {
         fs::write(root.join("plugins/example/main.js"), b"plugin").unwrap();
         fs::write(root.join("tools/templates/article.md"), b"template").unwrap();
         fs::write(root.join("config/hotkeys.json"), b"{\"x\":1}").unwrap();
+        fs::write(
+            root.join("config/community-plugins.json"),
+            br#"["example"]"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("plugins/example/manifest.json"),
+            br#"{"id":"example"}"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1149,7 +1219,27 @@ mod tests {
             fs::read(target.join("_tools/templates/article.md")).unwrap(),
             b"template"
         );
-        assert_eq!(changes.len(), 3);
+        assert_eq!(changes.len(), 5);
+    }
+
+    #[test]
+    fn incomplete_template_fails_before_any_target_changes() {
+        for missing in [
+            "config/hotkeys.json",
+            "config/community-plugins.json",
+            "plugins/example/manifest.json",
+            "plugins/example/main.js",
+        ] {
+            let temp = tempdir().unwrap();
+            let source = temp.path().join("source");
+            let target = temp.path().join("target");
+            make_source(&source);
+            make_vault(&target);
+            fs::remove_file(source.join(missing)).unwrap();
+            assert!(sync_master_to_vault(&source, &target, false).is_err());
+            assert_eq!(fs::read_dir(target.join(".obsidian")).unwrap().count(), 0);
+            assert!(!target.join("_tools").exists());
+        }
     }
 
     #[test]
@@ -1181,8 +1271,16 @@ mod tests {
         sync_master_to_vault(&source, &target, false).unwrap();
 
         fs::write(target.join(".obsidian/hotkeys.json"), b"{\"x\":2}").unwrap();
-        fs::write(target.join(".obsidian/plugins/example/main.js"), b"changed plugin").unwrap();
-        fs::write(target.join("_tools/templates/article.md"), b"changed template").unwrap();
+        fs::write(
+            target.join(".obsidian/plugins/example/main.js"),
+            b"changed plugin",
+        )
+        .unwrap();
+        fs::write(
+            target.join("_tools/templates/article.md"),
+            b"changed template",
+        )
+        .unwrap();
         fs::write(target.join("chapter.md"), b"content").unwrap();
 
         let changes = propagate_vault_to_master(&target, &source, false, false).unwrap();
@@ -1236,8 +1334,7 @@ mod tests {
         )
         .unwrap();
 
-        let error =
-            propagate_vault_to_master(&target, &source, false, false).unwrap_err();
+        let error = propagate_vault_to_master(&target, &source, false, false).unwrap_err();
         assert!(error.to_string().contains("apiKey"));
     }
 
@@ -1253,5 +1350,237 @@ mod tests {
         sync_master_to_vault(&source, &target, false).unwrap();
 
         assert!(!target.join("_tools/templates/README.md").exists());
+    }
+}
+
+/// Optional resource configuration. Operational switches remain explicit on the
+/// command line so a file can never silently enable pruning or reverse writes.
+#[derive(clap::Args, Debug, Default)]
+pub struct ResourceOptions {
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+    #[arg(long)]
+    pub master: Option<PathBuf>,
+}
+
+pub struct ResourceConfig {
+    pub master: Option<PathBuf>,
+    pub repos_root: Option<PathBuf>,
+}
+
+pub fn load_resource_config(
+    options: ResourceOptions,
+    repos_root: Option<PathBuf>,
+) -> Result<ResourceConfig> {
+    let mut config = ResourceConfig {
+        master: None,
+        repos_root: None,
+    };
+    if let Some(path) = options.config {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            env::current_dir()?.join(path)
+        };
+        let bytes =
+            fs::read(&path).with_context(|| format!("cannot read config {}", path.display()))?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid JSON config {}", path.display()))?;
+        let object = value
+            .as_object()
+            .context("configuration must be a JSON object")?;
+        for (key, value) in object {
+            if key != "master" && key != "repos_root" {
+                bail!("unknown config key {key}; expected master or repos_root (operation switches must be supplied inline)");
+            }
+            if value.is_null() {
+                continue;
+            }
+            let raw = value
+                .as_str()
+                .with_context(|| format!("config {key} must be a path string or null"))?;
+            if raw.is_empty() {
+                bail!("config {key} must not be empty");
+            }
+            let p = PathBuf::from(raw);
+            let p = if p.is_absolute() {
+                p
+            } else {
+                path.parent().context("config has no parent")?.join(p)
+            };
+            if key == "master" {
+                config.master = Some(p);
+            } else {
+                config.repos_root = Some(p);
+            }
+        }
+    }
+    if options.master.is_some() {
+        config.master = options.master;
+    }
+    if repos_root.is_some() {
+        config.repos_root = repos_root;
+    }
+    Ok(config)
+}
+
+/// Accept shell-safe Python-style keyword assignments without evaluating code.
+pub fn keyword_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut result = Vec::new();
+    let mut expecting_flag_value = false;
+    for (index, arg) in args.into_iter().enumerate() {
+        if index == 0 {
+            result.push(arg);
+            continue;
+        }
+        if expecting_flag_value {
+            result.push(arg);
+            expecting_flag_value = false;
+            continue;
+        }
+        if let Some(text) = arg.to_str() {
+            if ["--config", "--master", "--repos-root"].contains(&text) {
+                expecting_flag_value = true;
+            }
+            if !text.starts_with('-') {
+                if let Some((key, raw)) = text.split_once('=') {
+                    let known = [
+                        "config",
+                        "master",
+                        "repos_root",
+                        "prune",
+                        "apply",
+                        "allow_sensitive",
+                    ];
+                    if known.contains(&key) {
+                        if raw == "None" && ["config", "master", "repos_root"].contains(&key) {
+                            continue;
+                        }
+                        let value = if raw.len() >= 2
+                            && ((raw.starts_with('"') && raw.ends_with('"'))
+                                || (raw.starts_with('\'') && raw.ends_with('\'')))
+                        {
+                            &raw[1..raw.len() - 1]
+                        } else {
+                            raw
+                        };
+                        let value = match value {
+                            "True" => "true",
+                            "False" => "false",
+                            _ => value,
+                        };
+                        result.push(format!("--{}={value}", key.replace('_', "-")).into());
+                        continue;
+                    }
+                }
+            }
+        }
+        result.push(arg);
+    }
+    result
+}
+
+fn git_command() -> Command {
+    let adapter = env::var_os("VAULT_GIT_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/git.py")))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
+    let mut command = Command::new("/usr/bin/python3");
+    command.arg(adapter);
+    command
+}
+
+#[cfg(test)]
+mod resource_option_tests {
+    use super::*;
+    #[test]
+    fn optional_config_and_cli_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("options.json");
+        fs::write(
+            &path,
+            r#"{"master":"relative master","repos_root":"backups"}"#,
+        )
+        .unwrap();
+        let config = load_resource_config(
+            ResourceOptions {
+                config: Some(path),
+                master: Some(PathBuf::from("/explicit")),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.master.unwrap(), Path::new("/explicit"));
+        assert_eq!(config.repos_root.unwrap(), dir.path().join("backups"));
+        let config = load_resource_config(ResourceOptions::default(), None).unwrap();
+        assert!(config.master.is_none() && config.repos_root.is_none());
+    }
+    #[test]
+    fn explicit_missing_invalid_and_unsafe_configs_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("options.json");
+        assert!(load_resource_config(
+            ResourceOptions {
+                config: Some(path.clone()),
+                master: None
+            },
+            None
+        )
+        .is_err());
+        for text in [
+            "[]",
+            "invalid",
+            r#"{"apply":true}"#,
+            r#"{"master":7}"#,
+            r#"{"master":""}"#,
+        ] {
+            fs::write(&path, text).unwrap();
+            assert!(load_resource_config(
+                ResourceOptions {
+                    config: Some(path.clone()),
+                    master: None
+                },
+                None
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn python_keywords_preserve_values_without_evaluation() {
+        let args = [
+            "update",
+            "master=\"/path with spaces\"",
+            "prune=False",
+            "config=None",
+            "allow_sensitive=True",
+        ]
+        .map(std::ffi::OsString::from);
+        let got = keyword_args(args);
+        assert_eq!(
+            got,
+            [
+                "update",
+                "--master=/path with spaces",
+                "--prune=false",
+                "--allow-sensitive=true"
+            ]
+            .map(std::ffi::OsString::from)
+        );
+        let got =
+            keyword_args(["update", "--master", "master=literal"].map(std::ffi::OsString::from));
+        assert_eq!(got[2], "master=literal");
+    }
+}
+
+#[cfg(test)]
+mod git_root_regression {
+    use super::*;
+    #[test]
+    fn master_at_repository_root_is_checked_and_dirty_files_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        run_git(dir.path(), &["init", "-b", "main"]).unwrap();
+        ensure_git_clean_for_path(dir.path()).unwrap();
+        fs::write(dir.path().join("uncommitted.txt"), "fixture").unwrap();
+        assert!(ensure_git_clean_for_path(dir.path()).is_err());
     }
 }

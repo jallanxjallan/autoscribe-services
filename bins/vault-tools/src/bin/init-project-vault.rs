@@ -9,23 +9,24 @@ use vault_tools::{
 #[derive(Parser, Debug)]
 #[command(about = "Configure an existing Obsidian vault and attach its Dropbox bare backup repo")]
 struct Args {
-    #[arg(long)]
-    master: Option<PathBuf>,
+    #[command(flatten)]
+    resources: vault_tools::ResourceOptions,
 
     #[arg(long)]
     repos_root: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = Args::parse_from(vault_tools::keyword_args(std::env::args_os()));
     let vault = std::env::current_dir()?;
     ensure_vault_root(&vault)?;
 
-    let master = resolve_master(args.master)?;
+    let config = vault_tools::load_resource_config(args.resources, args.repos_root)?;
+    let master = resolve_master(config.master)?;
+    let repos_root = resolve_repos_root(config.repos_root)?;
     let changes = sync_master_to_vault(&master, &vault, false)?;
     print_changes("vault configuration", &changes);
 
-    let repos_root = resolve_repos_root(args.repos_root)?;
     let report = initialize_backup_repo(&vault, &repos_root)?;
 
     println!("vault:  {}", vault.display());
