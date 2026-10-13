@@ -442,13 +442,21 @@ pub fn run_checked(mut cmd: Command, label: &str) -> Result<Output> {
 }
 
 pub fn git_output(args: &[&str], label: &str) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("git");
+    let adapter = std::env::var_os("VAULT_GIT_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py")))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
+    let mut cmd = Command::new(adapter);
     cmd.args(args);
     Ok(run_checked(cmd, label)?.stdout)
 }
 
 pub fn git_output_owned(args: &[String], label: &str) -> Result<Vec<u8>> {
-    let mut cmd = Command::new("git");
+    let adapter = std::env::var_os("VAULT_GIT_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py")))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
+    let mut cmd = Command::new(adapter);
     cmd.args(args);
     Ok(run_checked(cmd, label)?.stdout)
 }

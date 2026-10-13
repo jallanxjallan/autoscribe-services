@@ -350,7 +350,7 @@ pub fn initialize_backup_repo(vault: &Path, repos_root: &Path) -> Result<InitRep
         ensure_bare_repo(&remote)?;
         false
     } else {
-        let status = Command::new("git")
+        let status = git_command()
             .arg("init")
             .arg("--bare")
             .arg(format!("--initial-branch={branch}"))
@@ -890,7 +890,7 @@ fn value_has_material(value: &Value) -> bool {
 }
 
 fn git_root(path: &Path) -> Result<Option<PathBuf>> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--show-toplevel"])
@@ -916,7 +916,7 @@ fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
         .strip_prefix(&canonical_root)
         .with_context(|| format!("{} is outside repository {}", path.display(), root.display()))?;
 
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(&root)
         .args(["status", "--porcelain", "--untracked-files=all", "--"])
@@ -938,7 +938,7 @@ fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
 }
 
 fn ensure_bare_repo(path: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-bare-repository"])
@@ -951,7 +951,7 @@ fn ensure_bare_repo(path: &Path) -> Result<()> {
 }
 
 fn ensure_origin(vault: &Path, remote: &Path) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(vault)
         .args(["remote", "get-url", "origin"])
@@ -975,7 +975,7 @@ fn ensure_origin(vault: &Path, remote: &Path) -> Result<()> {
         );
     }
 
-    let status = Command::new("git")
+    let status = git_command()
         .arg("-C")
         .arg(vault)
         .args(["remote", "add", "origin"])
@@ -1025,7 +1025,7 @@ fn write_managed_gitignore(vault: &Path) -> Result<()> {
 }
 
 fn current_branch(vault: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(vault)
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -1038,7 +1038,7 @@ fn current_branch(vault: &Path) -> Result<String> {
 }
 
 fn has_head(vault: &Path) -> Result<bool> {
-    Ok(Command::new("git")
+    Ok(git_command()
         .arg("-C")
         .arg(vault)
         .args(["rev-parse", "--verify", "HEAD"])
@@ -1048,7 +1048,7 @@ fn has_head(vault: &Path) -> Result<bool> {
 }
 
 fn has_staged_changes(vault: &Path) -> Result<bool> {
-    let status = Command::new("git")
+    let status = git_command()
         .arg("-C")
         .arg(vault)
         .args(["diff", "--cached", "--quiet"])
@@ -1068,7 +1068,7 @@ fn push_current_branch(vault: &Path) -> Result<()> {
 }
 
 fn run_git(vault: &Path, args: &[&str]) -> Result<Output> {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(vault)
         .args(args)
@@ -1254,4 +1254,12 @@ mod tests {
 
         assert!(!target.join("_tools/templates/README.md").exists());
     }
+}
+
+fn git_command() -> Command {
+    let adapter = env::var_os("VAULT_GIT_ADAPTER")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py")))
+        .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
+    Command::new(adapter)
 }

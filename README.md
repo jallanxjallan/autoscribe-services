@@ -230,3 +230,11 @@ After accepting a commit:
 ```
 
 The installer builds the release binaries beneath `/opt/autoscribe/services/releases/<sha>/bin` and atomically repoints `/opt/autoscribe/services/current`.
+
+## 13 October 2026 source reconciliation
+
+Main incorporates only recovered srv-input NDJSON ingress, obsolete embedded-plan test retirement, and Git-adapter invocation repairs. Unfinished vault-tools keyword/config work and the Typst watcher remain on recovery/deployed-source-2026-10-13. Do not activate the watcher.
+
+Installed srv-input SHA-256 ae594cc065b3ace788d4fa1ab2e140512255aae47484143f63f6ec0755d17b96 is associated with recovery 91e462ca3fda1ece83e37af00d06abc820238ae3; six other binaries match the archived 8b5e5156bc8ec142eb66928a5e1dc5e8d9e2e3a9 release. This mixed installed release was not rebuilt or replaced.
+
+Installed Bash srv-control-sync bytes were recovered and match SHA-256 941fbc452bb1ae128cf430a13b4ee41dec2a56cf950d52a4567cf797bf40d905. Exact bytes remain in the pre-consolidation server archive and acceptance evidence. Its original authoring commit is unknown; it is not the Rust implementation on control-sync-snapshot. Do not run the recovered helper as acceptance: it mutates the live catalogue.
