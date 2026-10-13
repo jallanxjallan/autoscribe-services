@@ -1,0 +1,6 @@
+# AutoScribe Dropbox Typst adapter
+remote=dropbox:typst
+state_dir=/var/lib/autoscribe/typst
+rclone=/home/jeremy/.local/bin/rclone
+typst=/usr/local/bin/typst
+poll_seconds=30

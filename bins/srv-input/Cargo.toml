@@ -10,3 +10,4 @@ clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 srv-common = { path = "../../crates/srv-common" }
+hex.workspace = true
