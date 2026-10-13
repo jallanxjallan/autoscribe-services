@@ -11,6 +11,9 @@ struct Args {
     #[command(flatten)]
     resources: vault_tools::ResourceOptions,
 
+    #[command(flatten)]
+    authoring: vault_tools::AuthoringOptions,
+
     /// Actually write the reviewed changes. Without this flag the command is a dry run.
     #[arg(long, num_args=0..=1, default_missing_value="true", action=clap::ArgAction::Set)]
     apply: Option<bool>,
@@ -25,8 +28,28 @@ fn main() -> Result<()> {
     let source = std::env::current_dir()?;
     ensure_vault_root(&source)?;
 
+    vault_tools::configure_authoring(&source, &args.authoring, false)?;
     let config = vault_tools::load_resource_config(args.resources, None)?;
     let master = resolve_master(config.master)?;
+    if args.apply.unwrap_or(false) {
+        vault_tools::ensure_git_clean_for_path(&master)?;
+        if master.join("config/authoring.json").exists() {
+            let root = args
+                .authoring
+                .templates_root
+                .clone()
+                .or_else(|| std::env::var_os("TEMPLATES_ROOT").map(std::path::PathBuf::from))
+                .ok_or_else(|| anyhow::anyhow!("missing templates root"))?;
+            vault_tools::ensure_git_clean_for_path(&root)?;
+        }
+    }
+    let template_changes = vault_tools::propagate_shared_templates(
+        &source,
+        &master,
+        args.apply.unwrap_or(false),
+        args.allow_sensitive.unwrap_or(false),
+    )?;
+    print_changes("shared authoring templates", &template_changes);
     let changes = propagate_vault_to_master(
         &source,
         &master,

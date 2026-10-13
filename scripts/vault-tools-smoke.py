@@ -7,6 +7,7 @@ with tempfile.TemporaryDirectory(prefix='vault-management-') as tmp:
     home=Path(tmp); master=home/'.config/obsidian-vault';vault=home/'Test Vault';repos=home/'Dropbox/Repos'
     for p in [master/'config',master/'plugins/example',master/'tools/templates',vault/'.obsidian',repos]:p.mkdir(parents=True,exist_ok=True)
     (master/'config/hotkeys.json').write_text('{}')
+    (master/'config/app.json').write_text('{"alwaysUpdateLinks":true}')
     (master/'config/community-plugins.json').write_text('["example"]')
     (master/'plugins/example/manifest.json').write_text('{"id":"example"}')
     (master/'plugins/example/main.js').write_text('// fixture')
@@ -20,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='vault-management-') as tmp:
         assert (r.returncode==0)==ok,(name,args,r.stdout,r.stderr)
         return r
     def git(root,*args):
-        return subprocess.run(['/usr/bin/python3',str(ADAPTER),'-C',str(root),*args],env=env,text=True,capture_output=True,check=True).stdout.strip()
+        return subprocess.run(([str(ADAPTER)] if os.access(ADAPTER,os.X_OK) else ['/usr/bin/python3',str(ADAPTER)])+['-C',str(root),*args],env=env,text=True,capture_output=True,check=True).stdout.strip()
     def snapshot(root):return {str(p.relative_to(root)):hashlib.sha256(p.read_bytes()).hexdigest() for p in root.rglob('*') if p.is_file() and '.git' not in p.parts}
     run('init-project-vault')
     assert (repos/'test_vault.git').is_dir()
@@ -38,13 +39,13 @@ with tempfile.TemporaryDirectory(prefix='vault-management-') as tmp:
     run('update-project-vault',f'config={config}',ok=False)
     run('update-project-vault','unknown=value',ok=False)
     assert snapshot(vault)==before
-    (vault/'.obsidian/hotkeys.json').write_text('{"fixture":[]}')
+    (vault/'.obsidian/app.json').write_text('{"alwaysUpdateLinks":false}')
     before=snapshot(master)
     run('update-master-vault')
     assert snapshot(master)==before
     # Explicit writes still require a clean, tracked master.
     git(master,'init','-b','main');git(master,'add','--all');git(master,'commit','-m','Fixture master')
     run('update-master-vault','apply=True','allow_sensitive=False')
-    assert (master/'config/hotkeys.json').read_text()=='{"fixture":[]}'
+    assert json.loads((master/'config/app.json').read_text())['alwaysUpdateLinks'] is False
     assert note.read_bytes()==note_bytes
 print('PASS: default init + bare backup, idempotent update, dry-run/apply safeguards, keyword/config precedence, invalid inputs, and raw note preservation')

@@ -9,9 +9,16 @@ struct Args {
     #[command(flatten)]
     resources: vault_tools::ResourceOptions,
 
+    #[command(flatten)]
+    authoring: vault_tools::AuthoringOptions,
+
     /// Remove stale files only from explicitly managed editing trees.
     #[arg(long, num_args=0..=1, default_missing_value="true", action=clap::ArgAction::Set)]
     prune: Option<bool>,
+
+    /// Report configuration drift without writing.
+    #[arg(long)]
+    audit: bool,
 }
 
 fn main() -> Result<()> {
@@ -19,6 +26,7 @@ fn main() -> Result<()> {
     let vault = std::env::current_dir()?;
     ensure_vault_root(&vault)?;
 
+    vault_tools::configure_authoring(&vault, &args.authoring, args.audit)?;
     let config = vault_tools::load_resource_config(args.resources, None)?;
     let master = resolve_master(config.master)?;
     let changes = sync_master_to_vault(&master, &vault, args.prune.unwrap_or(false))?;

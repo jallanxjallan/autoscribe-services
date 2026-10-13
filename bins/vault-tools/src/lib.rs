@@ -1,6 +1,8 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -27,15 +29,6 @@ const SOURCE_TREES: &[(&str, &str, bool)] = &[
     ("scripts", "_scripts", true),
     ("ui", "_ui", true),
     ("views", "_views", true),
-];
-
-const PRUNABLE_TARGET_DIRS: &[&str] = &[
-    "_tools",
-    "_templates",
-    "_scripts",
-    "_ui",
-    "_views",
-    ".obsidian/snippets",
 ];
 
 const GITIGNORE_START: &str = "# >>> vault-tools managed ignores >>>";
@@ -206,13 +199,16 @@ pub fn sync_master_to_vault(source: &Path, vault: &Path, prune: bool) -> Result<
         let from = source.join(&mapping.source_rel);
         let to = vault.join(&mapping.target_rel);
 
-        if file_differs(&from, &to)? {
+        let desired = effective_bytes(&from, &to, &mapping.target_rel, source, vault)?;
+        if !to.exists() || fs::read(&to)? != desired {
             let kind = if to.exists() {
                 ChangeKind::Updated
             } else {
                 ChangeKind::Added
             };
-            copy_file_atomic(&from, &to, vault)?;
+            if !AUTHORING_AUDIT.with(|v| v.get()) {
+                write_bytes_atomic(&desired, &to, vault)?;
+            }
             changes.push(Change {
                 kind,
                 path: mapping.target_rel.clone(),
@@ -220,22 +216,16 @@ pub fn sync_master_to_vault(source: &Path, vault: &Path, prune: bool) -> Result<
         }
     }
 
-    if prune {
-        let managed_targets = mappings
-            .iter()
-            .map(|mapping| mapping.target_rel.clone())
-            .collect::<BTreeSet<_>>();
-
-        for rel in collect_prunable_target_files(vault)? {
-            if !managed_targets.contains(&rel) {
-                let target = vault.join(&rel);
-                ensure_safe_destination(vault, &target)?;
-                fs::remove_file(&target)
-                    .with_context(|| format!("failed to remove {}", target.display()))?;
-                changes.push(Change {
-                    kind: ChangeKind::Removed,
-                    path: rel,
-                });
+    let retired = retired_paths(source)?;
+    for rel in retired {
+        if vault.join(&rel).is_file() {
+            changes.push(Change {
+                kind: ChangeKind::Removed,
+                path: rel.clone(),
+            });
+            if prune && !AUTHORING_AUDIT.with(|v| v.get()) {
+                ensure_safe_destination(vault, &vault.join(&rel))?;
+                fs::remove_file(vault.join(&rel))?;
             }
         }
     }
@@ -257,6 +247,17 @@ pub fn propagate_vault_to_master(
         ensure_git_clean_for_path(source)?;
     }
 
+    // Inspect known plugin configuration for credentials even if not capture-whitelisted.
+    if !allow_sensitive {
+        for mapping in collect_source_files(source)? {
+            if mapping.target_rel.ends_with("manifest.json") {
+                let rel = mapping.target_rel.parent().unwrap().join("data.json");
+                if vault.join(&rel).is_file() {
+                    ensure_no_sensitive_material(&vault.join(&rel), &rel)?;
+                }
+            }
+        }
+    }
     let mappings = collect_source_files(source)?;
     let mut reverse = BTreeMap::<PathBuf, PathBuf>::new();
 
@@ -266,7 +267,12 @@ pub fn propagate_vault_to_master(
         }
     }
 
-    add_new_reverse_candidates(vault, source, &mut reverse)?;
+    // Reverse capture is an explicit existing-resource whitelist. Project additions require source review.
+    reverse.retain(|target, _| {
+        !target.starts_with("_tools/templates")
+            && target != Path::new(".obsidian/authoring.json")
+            && target != Path::new(".obsidian/managed-resources.json")
+    });
 
     let mut changes = Vec::new();
 
@@ -277,7 +283,8 @@ pub fn propagate_vault_to_master(
         }
 
         let to = source.join(&source_rel);
-        if !file_differs(&from, &to)? {
+        let desired = reverse_bytes(&from, &to, &target_rel)?;
+        if to.exists() && fs::read(&to)? == desired {
             continue;
         }
 
@@ -295,7 +302,7 @@ pub fn propagate_vault_to_master(
         });
 
         if apply {
-            copy_file_atomic(&from, &to, source)?;
+            write_bytes_atomic(&desired, &to, source)?;
         }
     }
 
@@ -464,6 +471,34 @@ fn collect_source_files(source: &Path) -> Result<Vec<ManagedFile>> {
         }
     }
 
+    if source.join("config/authoring.json").exists() {
+        let root = templates_root()?;
+        let profile = selected_profile();
+        let profiles: Value =
+            serde_json::from_slice(&fs::read(root.join("obsidian/profiles.json"))?)?;
+        let definition = profiles
+            .get(&profile)
+            .context("unknown authoring profile")?;
+        let excluded = definition["exclude"]
+            .as_array()
+            .context("missing profile exclusions")?;
+        for rel in collect_relative_files(&root.join("obsidian"))? {
+            if rel.extension() != Some(OsStr::new("md"))
+                || is_auxiliary_source_file(&rel)
+                || excluded.iter().any(|v| v.as_str() == rel.to_str())
+            {
+                continue;
+            }
+            insert_mapping(
+                &mut by_target,
+                ManagedFile {
+                    source_rel: root.join("obsidian").join(&rel),
+                    target_rel: PathBuf::from("_tools/templates").join(rel),
+                    reverse: false,
+                },
+            )?;
+        }
+    }
     Ok(by_target.into_values().collect())
 }
 
@@ -579,102 +614,6 @@ fn collect_relative_files_inner(root: &Path, dir: &Path, files: &mut Vec<PathBuf
     Ok(())
 }
 
-fn collect_prunable_target_files(vault: &Path) -> Result<BTreeSet<PathBuf>> {
-    let mut result = BTreeSet::new();
-    for target_dir in PRUNABLE_TARGET_DIRS {
-        let root = vault.join(target_dir);
-        if !root.is_dir() {
-            continue;
-        }
-        for rel in collect_relative_files(&root)? {
-            let target_rel = PathBuf::from(target_dir).join(rel);
-            if !is_forbidden_target_relative(&target_rel) {
-                result.insert(target_rel);
-            }
-        }
-    }
-    Ok(result)
-}
-
-fn add_new_reverse_candidates(
-    vault: &Path,
-    source: &Path,
-    reverse: &mut BTreeMap<PathBuf, PathBuf>,
-) -> Result<()> {
-    // _tools and the other explicitly-managed editing trees are safe places for
-    // new reusable files created inside a project vault.
-    for (source_dir, target_dir, reverse_tree) in SOURCE_TREES {
-        if !*reverse_tree || *source_dir == "config" {
-            continue;
-        }
-
-        let target_root = vault.join(target_dir);
-        if !target_root.is_dir() {
-            continue;
-        }
-
-        for rel in collect_relative_files(&target_root)? {
-            let target_rel = PathBuf::from(target_dir).join(&rel);
-            if is_forbidden_target_relative(&target_rel) {
-                continue;
-            }
-            reverse
-                .entry(target_rel)
-                .or_insert_with(|| PathBuf::from(source_dir).join(rel));
-        }
-    }
-
-    // Supported top-level Obsidian JSON configuration is captured into config/
-    // unless an existing source file already owns the target path.
-    for name in ROOT_CONFIG_FILES {
-        let target_rel = PathBuf::from(".obsidian").join(name);
-        if reverse.contains_key(&target_rel) {
-            continue;
-        }
-        if vault.join(&target_rel).is_file() {
-            reverse.insert(target_rel, PathBuf::from("config").join(name));
-        }
-    }
-
-    // Plugin executables are installation artifacts and never flow back from a
-    // vault. Plugin data.json is reusable configuration and may be captured for
-    // plugins known to the source library.
-    let plugin_root = vault.join(".obsidian/plugins");
-    if plugin_root.is_dir() {
-        let mut entries =
-            fs::read_dir(&plugin_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-
-        for entry in entries {
-            let plugin_id = entry.file_name();
-            let Some(plugin_id_str) = plugin_id.to_str() else {
-                continue;
-            };
-            let target_rel = PathBuf::from(".obsidian/plugins")
-                .join(plugin_id_str)
-                .join("data.json");
-
-            if reverse.contains_key(&target_rel) || !vault.join(&target_rel).is_file() {
-                continue;
-            }
-
-            let known_plugin = source.join("plugins").join(plugin_id_str).is_dir()
-                || source.join("config/plugins").join(plugin_id_str).exists();
-
-            if known_plugin {
-                reverse.insert(
-                    target_rel,
-                    PathBuf::from("config/plugins")
-                        .join(plugin_id_str)
-                        .join("data.json"),
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn is_auxiliary_source_file(rel: &Path) -> bool {
     matches!(
         rel.file_name().and_then(OsStr::to_str),
@@ -717,74 +656,6 @@ fn same_existing_path(a: &Path, b: &Path) -> Result<bool> {
     let a = fs::canonicalize(a).with_context(|| format!("failed to resolve {}", a.display()))?;
     let b = fs::canonicalize(b).with_context(|| format!("failed to resolve {}", b.display()))?;
     Ok(a == b)
-}
-
-fn file_differs(source: &Path, target: &Path) -> Result<bool> {
-    if !target.exists() {
-        return Ok(true);
-    }
-
-    let source_meta = fs::symlink_metadata(source)
-        .with_context(|| format!("failed to inspect {}", source.display()))?;
-    if source_meta.file_type().is_symlink() || !source_meta.is_file() {
-        bail!("managed source is not a regular file: {}", source.display());
-    }
-
-    let target_meta = fs::symlink_metadata(target)
-        .with_context(|| format!("failed to inspect {}", target.display()))?;
-    if target_meta.file_type().is_symlink() {
-        bail!("refusing to read or overwrite symlink {}", target.display());
-    }
-    if !target_meta.is_file() {
-        bail!(
-            "refusing to read or overwrite non-file {}",
-            target.display()
-        );
-    }
-
-    if source_meta.len() != target_meta.len() {
-        return Ok(true);
-    }
-
-    Ok(fs::read(source)? != fs::read(target)?)
-}
-
-fn copy_file_atomic(source: &Path, target: &Path, destination_root: &Path) -> Result<()> {
-    ensure_safe_destination(destination_root, target)?;
-
-    let parent = target
-        .parent()
-        .context("managed target has no parent directory")?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-
-    ensure_safe_destination(destination_root, target)?;
-
-    let tmp = parent.join(format!(".vault-tools.{}.tmp", std::process::id()));
-    if tmp.exists() {
-        fs::remove_file(&tmp)
-            .with_context(|| format!("failed to remove stale {}", tmp.display()))?;
-    }
-
-    fs::copy(source, &tmp).with_context(|| {
-        format!(
-            "failed to copy {} to temporary file {}",
-            source.display(),
-            tmp.display()
-        )
-    })?;
-
-    let permissions = fs::metadata(source)?.permissions();
-    fs::set_permissions(&tmp, permissions)?;
-
-    fs::rename(&tmp, target).with_context(|| {
-        format!(
-            "failed to atomically replace {} from {}",
-            target.display(),
-            source.display()
-        )
-    })?;
-
-    Ok(())
 }
 
 fn ensure_safe_destination(root: &Path, target: &Path) -> Result<()> {
@@ -951,7 +822,7 @@ fn git_root(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(root.trim())))
 }
 
-fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
+pub fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
     let root = git_root(path)?.with_context(|| {
         format!(
             "vault source is not inside a Git repository: {}",
@@ -1209,7 +1080,7 @@ mod tests {
 
         assert_eq!(
             fs::read(target.join(".obsidian/hotkeys.json")).unwrap(),
-            b"{\"x\":1}"
+            b"{\n  \"x\": 1\n}"
         );
         assert_eq!(
             fs::read(target.join(".obsidian/plugins/example/main.js")).unwrap(),
@@ -1291,13 +1162,13 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert!(paths.contains("config/hotkeys.json"));
-        assert!(paths.contains("tools/templates/article.md"));
+        assert!(!paths.contains("tools/templates/article.md"));
         assert!(!paths.contains("plugins/example/main.js"));
         assert!(!paths.contains("chapter.md"));
     }
 
     #[test]
-    fn reverse_sync_can_add_plugin_data_for_known_plugin() {
+    fn reverse_sync_does_not_capture_unlisted_plugin_data() {
         let temp = tempdir().unwrap();
         let source = temp.path().join("source");
         let target = temp.path().join("target");
@@ -1313,10 +1184,7 @@ mod tests {
 
         let changes = propagate_vault_to_master(&target, &source, false, false).unwrap();
 
-        assert!(changes.iter().any(|change| {
-            change.path == Path::new("config/plugins/example/data.json")
-                && change.kind == ChangeKind::Added
-        }));
+        assert!(changes.is_empty());
     }
 
     #[test]
@@ -1336,6 +1204,49 @@ mod tests {
 
         let error = propagate_vault_to_master(&target, &source, false, false).unwrap_err();
         assert!(error.to_string().contains("apiKey"));
+    }
+
+    #[test]
+    fn audit_and_retirement_preserve_project_customizations() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        make_source(&source);
+        make_vault(&target);
+        fs::write(
+            source.join("config/managed-resources.json"),
+            br#"{"retired":["_tools/old.js"],"retired_commands":["retired"]}"#,
+        )
+        .unwrap();
+        fs::create_dir_all(target.join("_tools")).unwrap();
+        fs::write(target.join("_tools/old.js"), "retired").unwrap();
+        fs::write(target.join("_tools/custom.js"), "project").unwrap();
+        fs::write(
+            target.join(".obsidian/hotkeys.json"),
+            br#"{"x":9,"project":[],"retired":[]}"#,
+        )
+        .unwrap();
+        AUTHORING_AUDIT.with(|v| v.set(true));
+        let drift = sync_master_to_vault(&source, &target, true).unwrap();
+        AUTHORING_AUDIT.with(|v| v.set(false));
+        assert!(!drift.is_empty());
+        assert!(target.join("_tools/old.js").exists());
+        assert!(!target.join("_tools/templates/article.md").exists());
+        sync_master_to_vault(&source, &target, true).unwrap();
+        assert!(!target.join("_tools/old.js").exists());
+        assert_eq!(
+            fs::read_to_string(target.join("_tools/custom.js")).unwrap(),
+            "project"
+        );
+        let hotkeys: Value =
+            serde_json::from_slice(&fs::read(target.join(".obsidian/hotkeys.json")).unwrap())
+                .unwrap();
+        assert_eq!(hotkeys["x"], 1);
+        assert!(hotkeys.get("project").is_some());
+        assert!(hotkeys.get("retired").is_none());
+        assert!(sync_master_to_vault(&source, &target, true)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1485,9 +1396,17 @@ fn git_command() -> Command {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin/git.py")))
         .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
-    let mut command = Command::new("/usr/bin/python3");
-    command.arg(adapter);
-    command
+    use std::os::unix::fs::PermissionsExt;
+    if fs::metadata(&adapter)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+    {
+        Command::new(adapter)
+    } else {
+        let mut command = Command::new("/usr/bin/python3");
+        command.arg(adapter);
+        command
+    }
 }
 
 #[cfg(test)]
@@ -1583,4 +1502,365 @@ mod git_root_regression {
         fs::write(dir.path().join("uncommitted.txt"), "fixture").unwrap();
         assert!(ensure_git_clean_for_path(dir.path()).is_err());
     }
+}
+
+thread_local! { static AUTHORING_AUDIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[derive(clap::Args, Debug, Default)]
+pub struct AuthoringOptions {
+    /// Shared templates repository checkout (or TEMPLATES_ROOT).
+    #[arg(long)]
+    pub templates_root: Option<PathBuf>,
+    /// Authoring profile; existing vault selection is preserved when omitted.
+    #[arg(long)]
+    pub profile: Option<String>,
+}
+
+pub fn configure_authoring(vault: &Path, options: &AuthoringOptions, audit: bool) -> Result<()> {
+    if let Some(root) = &options.templates_root {
+        env::set_var("TEMPLATES_ROOT", fs::canonicalize(root)?);
+    }
+    let existing = vault.join(".obsidian/authoring.json");
+    let profile = if let Some(profile) = &options.profile {
+        profile.clone()
+    } else if existing.exists() {
+        let v: Value = serde_json::from_slice(&fs::read(existing)?)?;
+        v["profile"]
+            .as_str()
+            .context("authoring profile missing")?
+            .to_owned()
+    } else {
+        "general".to_owned()
+    };
+    env::set_var("OBSIDIAN_AUTHORING_PROFILE", profile);
+    AUTHORING_AUDIT.with(|v| v.set(audit));
+    Ok(())
+}
+fn selected_profile() -> String {
+    env::var("OBSIDIAN_AUTHORING_PROFILE").unwrap_or_else(|_| "general".into())
+}
+fn templates_root() -> Result<PathBuf> {
+    let root = PathBuf::from(env::var_os("TEMPLATES_ROOT").context(
+        "set TEMPLATES_ROOT or pass --templates-root; templates are owned by the shared repository",
+    )?);
+    Ok(fs::canonicalize(root)?)
+}
+fn retired_paths(source: &Path) -> Result<Vec<PathBuf>> {
+    let path = source.join("config/managed-resources.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let v: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let mut paths = Vec::new();
+    for value in v["retired"]
+        .as_array()
+        .context("invalid retired resource list")?
+    {
+        let rel = PathBuf::from(value.as_str().context("invalid retired path")?);
+        if !rel.starts_with("_tools")
+            || rel.components().any(|c| !matches!(c, Component::Normal(_)))
+        {
+            bail!("unsafe retired path");
+        }
+        paths.push(rel);
+    }
+    if source.join("config/authoring.json").exists() {
+        let root = templates_root()?;
+        let profiles: Value =
+            serde_json::from_slice(&fs::read(root.join("obsidian/profiles.json"))?)?;
+        for value in profiles[&selected_profile()]["exclude"]
+            .as_array()
+            .context("invalid profile")?
+        {
+            let rel = PathBuf::from(value.as_str().context("invalid template exclusion")?);
+            if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+                bail!("unsafe excluded template");
+            }
+            paths.push(PathBuf::from("_tools/templates").join(rel));
+        }
+    }
+    Ok(paths)
+}
+fn write_bytes_atomic(bytes: &[u8], target: &Path, root: &Path) -> Result<()> {
+    ensure_safe_destination(root, target)?;
+    let parent = target.parent().context("missing parent")?;
+    fs::create_dir_all(parent)?;
+    ensure_safe_destination(root, target)?;
+    let tmp = parent.join(format!(".vault-tools.{}.tmp", std::process::id()));
+    fs::write(&tmp, bytes)?;
+    fs::rename(tmp, target)?;
+    Ok(())
+}
+fn merged_json(master: &Value, current: &Value) -> Value {
+    match (master, current) {
+        (Value::Object(m), Value::Object(c)) => {
+            let mut result = c.clone();
+            for (key, value) in m {
+                result.insert(
+                    key.clone(),
+                    merged_json(value, c.get(key).unwrap_or(&Value::Null)),
+                );
+            }
+            Value::Object(result)
+        }
+        _ => master.clone(),
+    }
+}
+fn effective_bytes(
+    from: &Path,
+    to: &Path,
+    target: &Path,
+    source: &Path,
+    _vault: &Path,
+) -> Result<Vec<u8>> {
+    validate_source_file(from)?;
+    if to.exists() {
+        validate_source_file(to)?;
+    }
+    let bytes = fs::read(from)?;
+    let name = slash_path(target);
+    if name == ".obsidian/authoring.json" {
+        let profiles: Value =
+            serde_json::from_slice(&fs::read(templates_root()?.join("obsidian/profiles.json"))?)?;
+        let profile = selected_profile();
+        let definition = profiles.get(&profile).context("unknown profile")?;
+        return Ok(serde_json::to_vec_pretty(
+            &serde_json::json!({"profile":profile,"destinations":definition["destinations"]}),
+        )?);
+    }
+    if target.extension() != Some(OsStr::new("json")) || !name.starts_with(".obsidian/") {
+        return Ok(bytes);
+    }
+    let master: Value = serde_json::from_slice(&bytes)?;
+    let current: Value = if to.exists() {
+        serde_json::from_slice(&fs::read(to)?)?
+    } else {
+        master.clone()
+    };
+    let mut merged = merged_json(&master, &current);
+    if name == ".obsidian/community-plugins.json" {
+        let mut items = current.as_array().context("invalid plugin list")?.clone();
+        for item in master.as_array().context("invalid master plugin list")? {
+            if !items.contains(item) {
+                items.push(item.clone());
+            }
+        }
+        merged = Value::Array(items);
+    }
+    if name == ".obsidian/plugins/quickadd/data.json" {
+        let known = master["choices"].as_array().context("missing choices")?;
+        let mut choices = known.clone();
+        let retired = source.join("config/managed-resources.json");
+        let retired: Value = if retired.exists() {
+            serde_json::from_slice(&fs::read(retired)?)?
+        } else {
+            serde_json::json!({"retired_commands":[]})
+        };
+        for choice in current["choices"]
+            .as_array()
+            .context("missing current choices")?
+        {
+            let id = choice["id"].as_str().context("missing choice id")?;
+            let command = format!("quickadd:choice:{id}");
+            if !known.iter().any(|v| v["id"] == choice["id"])
+                && !retired["retired_commands"]
+                    .as_array()
+                    .context("missing retired commands")?
+                    .iter()
+                    .any(|v| v.as_str() == Some(&command))
+            {
+                choices.push(choice.clone());
+            }
+        }
+        merged["choices"] = Value::Array(choices);
+    }
+    if name == ".obsidian/hotkeys.json" {
+        let path = source.join("config/managed-resources.json");
+        if path.exists() {
+            let retired: Value = serde_json::from_slice(&fs::read(path)?)?;
+            for id in retired["retired_commands"]
+                .as_array()
+                .context("missing retired commands")?
+            {
+                merged
+                    .as_object_mut()
+                    .context("invalid hotkeys")?
+                    .remove(id.as_str().context("invalid command")?);
+            }
+        }
+    }
+    // Preserve user-added Templater commands; explicitly retired templates are removed.
+    if name == ".obsidian/plugins/templater-obsidian/data.json" {
+        let key = "enabled_templates_hotkeys";
+        let mut items = master[key]
+            .as_array()
+            .context("missing template commands")?
+            .clone();
+        for item in current[key]
+            .as_array()
+            .context("missing current template commands")?
+        {
+            if !items.iter().any(|v| v["template"] == item["template"]) {
+                items.push(item.clone());
+            }
+        }
+        let retired = retired_paths(source)?;
+        items.retain(|item| {
+            !retired
+                .iter()
+                .any(|p| p.to_str() == item["template"].as_str())
+        });
+        merged[key] = Value::Array(items);
+    }
+    filter_profile_commands(&mut merged, &master, &current, &name, source)?;
+    Ok(serde_json::to_vec_pretty(&merged)?)
+}
+fn filter_profile_commands(
+    merged: &mut Value,
+    master: &Value,
+    current: &Value,
+    name: &str,
+    source: &Path,
+) -> Result<()> {
+    let mut inactive = Vec::<String>::new();
+    let retired = source.join("config/managed-resources.json");
+    if retired.exists() {
+        let v: Value = serde_json::from_slice(&fs::read(retired)?)?;
+        for id in v["retired_commands"]
+            .as_array()
+            .context("invalid retired commands")?
+        {
+            inactive.push(id.as_str().context("invalid command")?.to_owned());
+        }
+    }
+    if source.join("config/authoring.json").exists() {
+        let profiles: Value =
+            serde_json::from_slice(&fs::read(templates_root()?.join("obsidian/profiles.json"))?)?;
+        let profile = &profiles[&selected_profile()];
+        for rel in profile["exclude"]
+            .as_array()
+            .context("invalid exclusions")?
+        {
+            inactive.push(format!(
+                "templater-obsidian:create-_tools/templates/{}",
+                rel.as_str().context("invalid exclusion")?
+            ));
+        }
+        if let Some(allowed) = profile["commands"].as_array() {
+            let choices: Value =
+                serde_json::from_slice(&fs::read(source.join("plugins/quickadd/data.json"))?)?;
+            for choice in choices["choices"].as_array().context("invalid choices")? {
+                if !allowed.iter().any(|v| v == &choice["name"]) {
+                    inactive.push(format!(
+                        "quickadd:choice:{}",
+                        choice["id"].as_str().context("invalid choice")?
+                    ));
+                }
+            }
+        }
+    }
+    if name == ".obsidian/plugins/cmdr/data.json" {
+        for (key, value) in master.as_object().context("invalid Commander settings")? {
+            if let Some(items) = value.as_array() {
+                let mut all = items.clone();
+                if let Some(custom) = current[key].as_array() {
+                    for item in custom {
+                        if !all.iter().any(|v| v["id"] == item["id"]) {
+                            all.push(item.clone());
+                        }
+                    }
+                }
+                all.retain(|v| !inactive.iter().any(|id| v["id"].as_str() == Some(id)));
+                merged[key] = Value::Array(all);
+            }
+        }
+    }
+    if name == ".obsidian/plugins/quickadd/data.json" {
+        if let Some(choices) = merged["choices"].as_array_mut() {
+            choices.retain(|v| {
+                !inactive.contains(&format!(
+                    "quickadd:choice:{}",
+                    v["id"].as_str().unwrap_or("")
+                ))
+            });
+        }
+    }
+    if name == ".obsidian/hotkeys.json" {
+        for id in inactive {
+            merged
+                .as_object_mut()
+                .context("invalid hotkeys")?
+                .remove(&id);
+        }
+    }
+    Ok(())
+}
+fn reverse_bytes(from: &Path, to: &Path, target: &Path) -> Result<Vec<u8>> {
+    validate_source_file(from)?;
+    let bytes = fs::read(from)?;
+    if target.extension() != Some(OsStr::new("json")) || !to.exists() {
+        return Ok(bytes);
+    }
+    let current: Value = serde_json::from_slice(&bytes)?;
+    let master: Value = serde_json::from_slice(&fs::read(to)?)?;
+    // Existing keys form the whitelist; runtime histories, project additions and paths never flow back.
+    fn project(current: &Value, master: &Value) -> Value {
+        match master {
+            Value::Object(keys) => Value::Object(
+                keys.iter()
+                    .map(|(k, v)| (k.clone(), project(current.get(k).unwrap_or(v), v)))
+                    .collect(),
+            ),
+            Value::Array(_) => master.clone(),
+            _ => current.clone(),
+        }
+    }
+    let projected = project(&current, &master);
+    // Keep original source formatting when values match.
+    if projected == master {
+        return Ok(fs::read(to)?);
+    }
+    Ok(serde_json::to_vec_pretty(&projected)?)
+}
+
+pub fn propagate_shared_templates(
+    vault: &Path,
+    source: &Path,
+    apply: bool,
+    allow_sensitive: bool,
+) -> Result<Vec<Change>> {
+    if !source.join("config/authoring.json").exists() {
+        return Ok(Vec::new());
+    }
+    let root = templates_root()?;
+    if apply {
+        ensure_git_clean_for_path(&root)?;
+    }
+    let mut changes = Vec::new();
+    for mapping in collect_source_files(source)? {
+        if !mapping.target_rel.starts_with("_tools/templates") || !mapping.source_rel.is_absolute()
+        {
+            continue;
+        }
+        let from = vault.join(&mapping.target_rel);
+        let to = &mapping.source_rel;
+        if !from.is_file() {
+            continue;
+        }
+        validate_source_file(&from)?;
+        if fs::read(&from)? == fs::read(to)? {
+            continue;
+        }
+        if !allow_sensitive {
+            ensure_no_sensitive_material(&from, &mapping.target_rel)?;
+        }
+        changes.push(Change {
+            kind: ChangeKind::Updated,
+            path: to.strip_prefix(&root)?.to_owned(),
+        });
+        if apply {
+            write_bytes_atomic(&fs::read(from)?, to, &root)?;
+        }
+    }
+    Ok(changes)
 }

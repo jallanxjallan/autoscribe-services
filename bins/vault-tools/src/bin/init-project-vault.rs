@@ -12,6 +12,9 @@ struct Args {
     #[command(flatten)]
     resources: vault_tools::ResourceOptions,
 
+    #[command(flatten)]
+    authoring: vault_tools::AuthoringOptions,
+
     #[arg(long)]
     repos_root: Option<PathBuf>,
 }
@@ -21,6 +24,7 @@ fn main() -> Result<()> {
     let vault = std::env::current_dir()?;
     ensure_vault_root(&vault)?;
 
+    vault_tools::configure_authoring(&vault, &args.authoring, false)?;
     let config = vault_tools::load_resource_config(args.resources, args.repos_root)?;
     let master = resolve_master(config.master)?;
     let repos_root = resolve_repos_root(config.repos_root)?;

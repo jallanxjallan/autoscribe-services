@@ -1,7 +1,6 @@
 # Vault tools
 
-Three Rust binaries manage one generic Obsidian vault model. There are no vault
-profiles or vault types.
+Three Rust binaries manage reusable Obsidian resources and explicit authoring profiles.
 
 The canonical source is a **source library**, not an Obsidian vault. It does
 not contain or require `.obsidian/`.
@@ -133,8 +132,7 @@ update-master-vault
 
 The master defaults to `~/.config/obsidian-vault`; backup repositories default
 to `~/Dropbox/Repos`. Existing explicit master/repository environment variables
-remain supported. Git operations use `~/.local/bin/git.py` through
-`/usr/bin/python3`, or the explicit `VAULT_GIT_ADAPTER` path. No Git synchronization
+remain supported. Git operations use the executable `~/.local/bin/git.py`, or the explicit `VAULT_GIT_ADAPTER` path. Older non-executable Python adapters retain their `/usr/bin/python3` fallback. No Git synchronization
 runs automatically; initialization deliberately creates/pushes its bare backup.
 
 Optional JSON configuration and Python-style keyword assignments:
@@ -164,3 +162,27 @@ rewritten by resource synchronization.
 Server verification: `cargo test -p vault-tools`, strict Clippy, static musl
 release build, then `python3 scripts/vault-tools-smoke.py /absolute/release /absolute/git.py`.
 The smoke script creates only disposable vaults and backup repositories.
+
+
+## Canonical authoring profiles
+
+Template definitions are owned only by `jallanxjallan/templates/obsidian`. Set
+`TEMPLATES_ROOT` to that checkout, or pass `--templates-root /absolute/path`.
+`--profile general`, `destination-guide`, `long-form`, `short-form`, and `website` select the destinations
+and template exclusions in `obsidian/profiles.json`. Selection persists in the
+vault's `.obsidian/authoring.json`; later updates preserve it when omitted.
+The destination-guide profile excludes chapter, section and composition creation.
+
+`update-project-vault --audit` reports the same differences as an update but
+writes nothing. JSON updates merge managed keys and preserve unrelated settings,
+QuickAdd choices, plugin IDs and template commands. Explicit retired command IDs
+are removed. `--prune` removes only the reviewed retired-resource list and
+profile-excluded templates; it never deletes unknown project customizations.
+
+Reverse capture uses existing mapped source files as the whitelist. It excludes
+project profile configuration and unknown additions. Shared templates return to
+the shared templates checkout and require its clean Git state. Existing JSON
+keys form a capture whitelist, and configuration arrays stay canonical to avoid
+capturing runtime histories. Review reusable array changes directly in their
+owner repository. Plugin executables never flow back. No note content or frozen
+NDJSON/dispatch/writeback interface is changed by these operations.
