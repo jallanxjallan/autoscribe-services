@@ -238,3 +238,9 @@ Main incorporates only recovered srv-input NDJSON ingress, obsolete embedded-pla
 Installed srv-input SHA-256 ae594cc065b3ace788d4fa1ab2e140512255aae47484143f63f6ec0755d17b96 is associated with recovery 91e462ca3fda1ece83e37af00d06abc820238ae3; six other binaries match the archived 8b5e5156bc8ec142eb66928a5e1dc5e8d9e2e3a9 release. This mixed installed release was not rebuilt or replaced.
 
 Installed Bash srv-control-sync bytes were recovered and match SHA-256 941fbc452bb1ae128cf430a13b4ee41dec2a56cf950d52a4567cf797bf40d905. Exact bytes remain in the pre-consolidation server archive and acceptance evidence. Its original authoring commit is unknown; it is not the Rust implementation on control-sync-snapshot. Do not run the recovered helper as acceptance: it mutates the live catalogue.
+
+## Prepared-call ingest candidate (6 November 2026)
+
+`srv-input` sends document envelopes to `asc ingest`, which prepares each document through the versioned Pandoc defaults before calling enqueue. Raw `autoscribe.document.v1` and `autoscribe.input.v3` envelopes pass through without Rust document interpretation. Invalid siblings reach per-record diagnostics rather than preventing valid siblings from being accepted. A transport with failures is retained; accepted records deduplicate on retry.
+
+This change must be released together with the AutoScribe prepared-call adapter, Extensions interpretation filters and Templates ingest defaults. It is not a standalone production deployment. The Python semantic Git dispatcher is retired; use the document-envelope/SSH submission interfaces. Historical repo-push hook examples elsewhere in this repository are not a supported candidate ingress path.

@@ -195,6 +195,15 @@ fn canonical_input(
     value: Value,
     max_body_bytes: usize,
 ) -> Result<Value> {
+    if matches!(value.get("schema").and_then(Value::as_str),
+        Some("autoscribe.document.v1" | "autoscribe.input.v3")) {
+        // Raw document envelopes are interpreted by the ingest adapter. Rust
+        // checks transport limits; it does not discover document metadata.
+        if serde_json::to_vec(&value)?.len() > max_body_bytes.saturating_mul(2) {
+            bail!("raw envelope exceeds transport limit");
+        }
+        return Ok(value);
+    }
     if value.get("schema").and_then(Value::as_str).is_some_and(|s| s.starts_with("autoscribe.input."))
         || (value.get("schema").is_some() && value.get("plan").is_none()) {
         validate_parsed_input(&value, max_body_bytes)?;
@@ -268,14 +277,18 @@ fn parse_transport(
         if raw.as_bytes().len() > max_record_bytes {
             bail!("line {line_number} exceeds {max_record_bytes} bytes");
         }
-        let value: Value = serde_json::from_str(raw)
-            .with_context(|| format!("line {line_number} is not valid JSON"))?;
-        records.push(canonical_input(
-            transport_file,
-            line_number,
-            value,
-            max_body_bytes,
-        )?);
+        let value: Value = match serde_json::from_str(raw) {
+            Ok(value) => value,
+            Err(error) => {
+                records.push(json!({"schema":"autoscribe.invalid-envelope.v1",
+                    "diagnostic":{"line":line_number,"error":error.to_string(),"raw":raw}}));
+                continue;
+            }
+        };
+        match canonical_input(transport_file,line_number,value.clone(),max_body_bytes) {
+            Ok(record) => records.push(record),
+            Err(_) => records.push(value), // adapter returns a structured per-record failure
+        }
     }
 
     if records.is_empty() {
@@ -286,18 +299,18 @@ fn parse_transport(
 
 fn enqueue_records(records: &[Value]) -> Result<Vec<u8>> {
     let mut child = Command::new(asc_binary())
-        .arg("enqueue")
+        .arg("ingest")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to execute asc enqueue")?;
+        .context("failed to execute asc ingest")?;
 
     {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to open asc enqueue stdin"))?;
+            .ok_or_else(|| anyhow::anyhow!("failed to open asc ingest stdin"))?;
         for record in records {
             serde_json::to_writer(&mut stdin, record)?;
             stdin.write_all(b"\n")?;
@@ -306,13 +319,16 @@ fn enqueue_records(records: &[Value]) -> Result<Vec<u8>> {
 
     let output = child
         .wait_with_output()
-        .context("failed waiting for asc enqueue")?;
+        .context("failed waiting for asc ingest")?;
     if !output.status.success() {
-        bail!(
-            "asc enqueue failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let failures:Vec<Value> = String::from_utf8_lossy(&output.stdout).lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("failure").is_some())
+            .map(|value| json!({"record_id":value.get("record_id"),
+                "submission_id":value.get("submission_id"),"line":value.get("line"),
+                "failure":value.get("failure")})).collect();
+        bail!("asc ingest failed with {}: {}; diagnostics: {}", output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),json!(failures));
     }
     Ok(output.stdout)
 }
@@ -426,6 +442,12 @@ mod tests {
             "assets":[{"path":"assets/pic.png","sha256":sha256_hex(b"abc"),"content_hex":"616263"}]})
     }
     #[test]
+    fn raw_document_is_forwarded_to_adapter_without_semantic_requirements() {
+        let value=json!({"schema":"autoscribe.document.v1","document":"## Café 東京",
+            "submission_id":"sub_test","call_source":"client_origin","baggage":{"custom":[1,true]}});
+        assert_eq!(canonical_input("staging.ndjson",1,value.clone(),1048576).unwrap(),value);
+    }
+    #[test]
     fn parsed_envelope_is_forwarded_without_transformations() {
         let input = parsed();
         assert_eq!(canonical_input("a.ndjson",1,input.clone(),1048576).unwrap(),input);
@@ -459,8 +481,8 @@ mod tests {
         assert_eq!(output["schema"],INPUT_SCHEMA);
     }
     #[test]
-    fn invalid_later_record_rejects_entire_batch_before_enqueue() {
+    fn invalid_later_record_does_not_block_valid_siblings() {
         let bytes=format!("{}\n{{}}\n",parsed());
-        assert!(parse_transport("a.ndjson",bytes.as_bytes(),2097152,1048576).is_err());
+        assert_eq!(parse_transport("a.ndjson",bytes.as_bytes(),2097152,1048576).unwrap().len(),2);
     }
 }

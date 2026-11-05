@@ -28,6 +28,10 @@ struct ResponseRecord {
     call_id: String,
     content: String,
     baggage: Value,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    failure: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +141,9 @@ fn main() -> Result<()> {
     read_ndjson::<ResponseRecord, _>(policy.limits.max_record_bytes, |response| {
         if response.schema != RESPONSE_SCHEMA {
             bail!("unsupported response schema: {}", response.schema);
+        }
+        if response.status.as_deref() == Some("failed") || response.failure.is_some() {
+            bail!("failed response cannot create an output effect");
         }
         safe_identifier(&response.call_id, "call_id", 160)?;
         if response.content.len() > policy.limits.max_body_bytes {
