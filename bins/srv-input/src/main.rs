@@ -1,10 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use serde::Serialize;
-use serde_json::{json, Map, Value};
-use srv_common::{
-    canonical_json_bytes, load_policy, safe_identifier, sha256_hex, INPUT_SCHEMA,
-};
+use serde_json::{json, Value};
+use srv_common::load_policy;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
@@ -17,7 +14,7 @@ const MAX_TRANSPORT_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
-    about = "Validate parsed Dropbox NDJSON envelopes and enqueue them; retain legacy text compatibility"
+    about = "Forward native-document NDJSON envelopes to the ingest adapter"
 )]
 struct Args {
     #[arg(long, default_value = "/etc/autoscribe/services.toml")]
@@ -30,17 +27,6 @@ struct Args {
     /// Poll interval in seconds when running as a daemon.
     #[arg(long, default_value_t = 1.0)]
     poll_seconds: f64,
-}
-
-#[derive(Debug, Serialize)]
-struct CanonicalInput {
-    schema: String,
-    record_id: String,
-    source: Value,
-    content: String,
-    content_sha256: String,
-    routing: Value,
-    baggage: Value,
 }
 
 fn rclone_binary() -> OsString {
@@ -87,175 +73,8 @@ fn safe_transport_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_plan(plan: &str) -> Result<()> {
-    safe_identifier(plan, "plan", 160)?;
-    if !plan.starts_with("pln_") {
-        bail!("plan must be a pln_ identity");
-    }
-    Ok(())
-}
-
-fn validate_text(content: &str, max_body_bytes: usize) -> Result<()> {
-    if content.is_empty() {
-        bail!("content must be non-empty text");
-    }
-    if content.len() > max_body_bytes {
-        bail!("content exceeds {max_body_bytes} bytes");
-    }
-    for ch in content.chars() {
-        if ch == '\0' || (ch.is_control() && !matches!(ch, '\n' | '\r' | '\t' | '\u{000C}')) {
-            bail!("content contains a non-text control character U+{:04X}", ch as u32);
-        }
-    }
-    Ok(())
-}
-
-fn relative_path(value: &str) -> Result<()> {
-    if value.is_empty() || value.contains(['\\', ':'])
-        || value.chars().any(char::is_control)
-        || value.split('/').any(|p| p.is_empty() || p == "." || p == ".." || p.eq_ignore_ascii_case(".git")) {
-        bail!("unsafe package path: {value:?}");
-    }
-    Ok(())
-}
-
-fn text_field<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("missing text field: {key}"))
-}
-
-fn digest(value: &str) -> Result<()> {
-    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        bail!("invalid SHA-256");
-    }
-    Ok(())
-}
-
-fn validate_parsed_input(value: &Value, limit: usize) -> Result<()> {
-    if value["schema"] != "autoscribe.input.v2" || value["content_format"] != "markdown"
-        || value["directive_policy"] != "inline.v1" {
-        bail!("unsupported parsed envelope, content format, or directive policy");
-    }
-    safe_identifier(text_field(value, "record_id")?, "record_id", 160)?;
-    let content = text_field(value, "content")?;
-    validate_text(content, limit)?;
-    if text_field(value, "content_sha256")? != sha256_hex(content.as_bytes()) {
-        bail!("content checksum mismatch");
-    }
-    validate_plan(text_field(&value["routing"], "plan_id")?)?;
-    let source = &value["source"];
-    if source["kind"] != "obsidian" { bail!("source kind must be obsidian"); }
-    relative_path(text_field(source, "path")?)?;
-    safe_identifier(text_field(source, "slug")?, "slug", 160)?;
-    digest(text_field(source, "vault_id")?)?;
-    let client = &value["baggage"]["client"];
-    if client["source_path"] != source["path"] || client["source_slug"] != source["slug"] || client["vault_id"] != source["vault_id"] {
-        bail!("source/baggage identity mismatch");
-    }
-    digest(text_field(client, "source_body_sha256")?)?;
-    text_field(client, "frontmatter")?; // opaque return bytes; never parse YAML here
-    let refs = value["references"].as_array().context("references must be an array")?;
-    let mut paths = std::collections::BTreeSet::new();
-    for reference in refs {
-        let path = text_field(reference, "path")?;
-        relative_path(path)?;
-        if !paths.insert(path) { bail!("duplicate source reference"); }
-        safe_identifier(text_field(reference, "slug")?, "reference slug", 160)?;
-        digest(text_field(reference, "content_sha256")?)?;
-    }
-    if !refs.iter().any(|r| r["path"] == source["path"] && r["slug"] == source["slug"]
-        && r["content_sha256"] == client["source_body_sha256"]) {
-        bail!("root source reference identity/checksum mismatch");
-    }
-    let assets = value["assets"].as_array().context("assets must be an array")?;
-    let mut paths = std::collections::BTreeSet::new();
-    let mut total = 0usize;
-    for asset in assets {
-        let path = text_field(asset, "path")?;
-        relative_path(path)?;
-        let lower = path.to_lowercase();
-        if !path.starts_with("assets/")
-            || paths.iter().any(|p: &String| p.starts_with(&(lower.clone() + "/")) || lower.starts_with(&(p.clone() + "/")))
-            || !paths.insert(lower) {
-            bail!("asset must have unique package-relative assets/ path");
-        }
-        let data = text_field(asset, "content_hex")?;
-        if data.len() > limit.saturating_mul(2) { bail!("asset too large"); }
-        let bytes = hex::decode(data).context("invalid asset hex bytes")?;
-        total = total.checked_add(bytes.len()).context("asset size overflow")?;
-        if total > limit { bail!("package assets exceed body limit"); }
-        if text_field(asset, "sha256")? != sha256_hex(&bytes) { bail!("asset checksum mismatch"); }
-    }
-    Ok(())
-}
-
-fn canonical_input(
-    transport_file: &str,
-    line_number: usize,
-    value: Value,
-    max_body_bytes: usize,
-) -> Result<Value> {
-    if matches!(value.get("schema").and_then(Value::as_str),
-        Some("autoscribe.document.v1" | "autoscribe.input.v3")) {
-        // Raw document envelopes are interpreted by the ingest adapter. Rust
-        // checks transport limits; it does not discover document metadata.
-        if serde_json::to_vec(&value)?.len() > max_body_bytes.saturating_mul(2) {
-            bail!("raw envelope exceeds transport limit");
-        }
-        return Ok(value);
-    }
-    if value.get("schema").and_then(Value::as_str).is_some_and(|s| s.starts_with("autoscribe.input."))
-        || (value.get("schema").is_some() && value.get("plan").is_none()) {
-        validate_parsed_input(&value, max_body_bytes)?;
-        return Ok(value);
-    }
-    let mut object: Map<String, Value> = value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("line {line_number} must be a JSON object"))?;
-
-    let content = object
-        .remove("content")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| anyhow::anyhow!("line {line_number} content must be non-empty text"))?;
-    validate_text(&content, max_body_bytes)
-        .with_context(|| format!("line {line_number} content rejected"))?;
-
-    let plan = object
-        .remove("plan")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| anyhow::anyhow!("line {line_number} plan must be non-empty text"))?;
-    validate_plan(&plan).with_context(|| format!("line {line_number} plan rejected"))?;
-
-    let baggage = Value::Object(object);
-    let content_sha256 = sha256_hex(content.as_bytes());
-    let identity = json!({
-        "plan": &plan,
-        "content_sha256": &content_sha256,
-        "baggage": &baggage,
-    });
-    let record_id = format!(
-        "inp_{}",
-        &sha256_hex(&canonical_json_bytes(&identity)?)[..32]
-    );
-
-    Ok(serde_json::to_value(CanonicalInput {
-        schema: INPUT_SCHEMA.to_string(),
-        record_id,
-        source: json!({
-            "kind": "dropbox_ndjson",
-            "transport_file": transport_file,
-            "line": line_number,
-        }),
-        content,
-        content_sha256,
-        routing: json!({"plan_id": plan}),
-        baggage,
-    })?)
-}
-
 fn parse_transport(
-    transport_file: &str,
+    _transport_file: &str,
     bytes: &[u8],
     max_record_bytes: usize,
     max_body_bytes: usize,
@@ -277,7 +96,7 @@ fn parse_transport(
         if raw.as_bytes().len() > max_record_bytes {
             bail!("line {line_number} exceeds {max_record_bytes} bytes");
         }
-        let value: Value = match serde_json::from_str(raw) {
+        let mut value: Value = match serde_json::from_str(raw) {
             Ok(value) => value,
             Err(error) => {
                 records.push(json!({"schema":"autoscribe.invalid-envelope.v1",
@@ -285,10 +104,13 @@ fn parse_transport(
                 continue;
             }
         };
-        match canonical_input(transport_file,line_number,value.clone(),max_body_bytes) {
-            Ok(record) => records.push(record),
-            Err(_) => records.push(value), // adapter returns a structured per-record failure
+        let document=value.get("document").or_else(||value.get("raw_markdown"))
+            .and_then(Value::as_str);
+        if document.is_some_and(|text| text.len()>max_body_bytes) {
+            value["schema"]=json!("autoscribe.invalid-envelope.v1");
+            value["diagnostic"]=json!({"line":line_number,"error":"Document exceeds transport body limit"});
         }
+        records.push(value);
     }
 
     if records.is_empty() {
@@ -431,58 +253,25 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn parsed() -> Value {
-        json!({"schema":"autoscribe.input.v2","record_id":"inp_test","content_format":"markdown",
-            "directive_policy":"inline.v1","content":"::: directive\nKeep inline\n:::\nBody\n",
-            "content_sha256":sha256_hex(b"::: directive\nKeep inline\n:::\nBody\n"),
-            "source":{"kind":"obsidian","path":"Notes/a.md","slug":"psg_a","vault_id":sha256_hex(b"vault")},
-            "routing":{"plan_id":"pln_TEST"},
-            "baggage":{"client":{"source_path":"Notes/a.md","source_slug":"psg_a","vault_id":sha256_hex(b"vault"),"source_body_sha256":sha256_hex(b"body"),"frontmatter":"---\nslug: psg_a\n---\n"}},
-            "references":[{"path":"Notes/a.md","slug":"psg_a","content_sha256":sha256_hex(b"body")}],
-            "assets":[{"path":"assets/pic.png","sha256":sha256_hex(b"abc"),"content_hex":"616263"}]})
-    }
     #[test]
-    fn raw_document_is_forwarded_to_adapter_without_semantic_requirements() {
+    fn raw_document_is_forwarded_without_origin_or_semantic_requirements() {
         let value=json!({"schema":"autoscribe.document.v1","document":"## Café 東京",
-            "submission_id":"sub_test","call_source":"client_origin","baggage":{"custom":[1,true]}});
-        assert_eq!(canonical_input("staging.ndjson",1,value.clone(),1048576).unwrap(),value);
+            "submission_id":"00000000-0000-4000-8000-000000000001","baggage":{"custom":[1,true]}});
+        let bytes=format!("{value}\n");
+        assert_eq!(parse_transport("staging.ndjson",bytes.as_bytes(),2097152,1048576).unwrap(),vec![value]);
     }
     #[test]
-    fn parsed_envelope_is_forwarded_without_transformations() {
-        let input = parsed();
-        assert_eq!(canonical_input("a.ndjson",1,input.clone(),1048576).unwrap(),input);
+    fn malformed_record_does_not_block_valid_siblings() {
+        let bytes=b"{invalid json}\n{\"schema\":\"autoscribe.document.v1\",\"document\":\"Body\"}\n";
+        let records=parse_transport("a.ndjson",bytes,2097152,1048576).unwrap();
+        assert_eq!(records.len(),2);
+        assert_eq!(records[0]["schema"],"autoscribe.invalid-envelope.v1");
+        assert_eq!(records[1]["document"],"Body");
     }
     #[test]
-    fn rejects_version_hash_identity_and_asset_errors() {
-        for (pointer, value) in [
-            ("/schema",json!("autoscribe.input.v99")),
-            ("/content_sha256",json!("0".repeat(64))),
-            ("/baggage/client/source_slug",json!("other")),
-            ("/assets/0/path",json!("assets/../escape")),
-            ("/assets/0/path",json!("/absolute")),
-            ("/assets/0/path",json!("assets/a:b")),
-            ("/assets/0/sha256",json!("0".repeat(64))),
-            ("/assets/0/content_hex",json!("xx")),
-            ("/directive_policy",json!("extract")),
-        ] {
-            let mut input=parsed(); *input.pointer_mut(pointer).unwrap()=value;
-            assert!(canonical_input("a.ndjson",1,input,1048576).is_err(),"{pointer}");
-        }
-        let mut input=parsed();let duplicate=input["assets"][0].clone();
-        input["assets"].as_array_mut().unwrap().push(duplicate);
-        assert!(validate_parsed_input(&input,1048576).is_err());
-    }
-    #[test]
-    fn legacy_record_retains_existing_content_and_baggage() {
-        let input=json!({"content":"::: directive\nKeep\n:::\nBody","plan":"pln_TEST","client":{"x":1}});
-        let output=canonical_input("a.ndjson",1,input.clone(),1048576).unwrap();
-        assert_eq!(output["content"],input["content"]);
-        assert_eq!(output["baggage"]["client"],input["client"]);
-        assert_eq!(output["schema"],INPUT_SCHEMA);
-    }
-    #[test]
-    fn invalid_later_record_does_not_block_valid_siblings() {
-        let bytes=format!("{}\n{{}}\n",parsed());
-        assert_eq!(parse_transport("a.ndjson",bytes.as_bytes(),2097152,1048576).unwrap().len(),2);
+    fn body_limit_is_a_per_record_transport_diagnostic() {
+        let records=parse_transport("a.ndjson",b"{\"document\":\"Long body\"}\n{\"document\":\"ok\"}\n",2097152,2).unwrap();
+        assert_eq!(records[0]["schema"],"autoscribe.invalid-envelope.v1");
+        assert_eq!(records[1]["document"],"ok");
     }
 }
