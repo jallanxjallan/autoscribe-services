@@ -142,7 +142,7 @@ fn main() -> Result<()> {
         if response.schema != RESPONSE_SCHEMA {
             bail!("unsupported response schema: {}", response.schema);
         }
-        if response.status.as_deref() == Some("failed") || response.failure.is_some() {
+        if response.status.as_deref() != Some("completed") || response.failure.is_some() {
             bail!("failed response cannot create an output effect");
         }
         safe_identifier(&response.call_id, "call_id", 160)?;

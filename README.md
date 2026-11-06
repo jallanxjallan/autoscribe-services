@@ -1,5 +1,15 @@
 # AutoScribe Services
 
+> **6 November 2026 correction scope:** AutoScribe client submission, response
+> delivery and local update/create use SSH/SCP exclusively. `bins/srv-export`
+> remains legacy Dropbox response-export code and is unchanged by this correction.
+> Its current implementation polls pending exports and writes via `rclone`; the
+> historical effect-export examples below do not describe that implementation.
+> It is not integrated into the SSH client path. Signed server output effects
+> remain a separate authorization mechanism; `srv-output` requires a completed,
+> failure-free response. No exporter installation or runtime status was changed.
+
+
 Rust trust-boundary operations for AutoScribe.
 
 The core server boundary is deliberately limited to **two data modes**:
