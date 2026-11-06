@@ -13,10 +13,9 @@ use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
-pub const INPUT_SCHEMA: &str = "autoscribe.input.v1";
 pub const RESPONSE_SCHEMA: &str = "autoscribe.response.v1";
-pub const EFFECT_SCHEMA: &str = "autoscribe.effect.v1";
-pub const RECEIPT_SCHEMA: &str = "autoscribe.receipt.v1";
+pub const EFFECT_SCHEMA: &str = "autoscribe.effect.v2";
+pub const RECEIPT_SCHEMA: &str = "autoscribe.receipt.v2";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
@@ -31,8 +30,6 @@ pub struct Policy {
 pub struct PathsPolicy {
     #[serde(default)]
     pub repo_roots: Vec<PathBuf>,
-    #[serde(default)]
-    pub file_roots: Vec<PathBuf>,
     pub effect_key_file: PathBuf,
     #[serde(default = "default_effects_db")]
     pub effects_db: PathBuf,
@@ -46,8 +43,6 @@ pub struct Limits {
     pub max_record_bytes: usize,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
-    #[serde(default = "default_max_outputs")]
-    pub max_outputs: usize,
     #[serde(default = "default_max_control_file_bytes")]
     pub max_control_file_bytes: usize,
     #[serde(default = "default_max_control_records")]
@@ -59,7 +54,6 @@ impl Default for Limits {
         Self {
             max_record_bytes: default_max_record_bytes(),
             max_body_bytes: default_max_body_bytes(),
-            max_outputs: default_max_outputs(),
             max_control_file_bytes: default_max_control_file_bytes(),
             max_control_records: default_max_control_records(),
         }
@@ -102,10 +96,6 @@ fn default_max_body_bytes() -> usize {
     1024 * 1024
 }
 
-fn default_max_outputs() -> usize {
-    16
-}
-
 fn default_max_control_file_bytes() -> usize {
     256 * 1024
 }
@@ -132,12 +122,11 @@ pub fn load_policy(path: &Path) -> Result<Policy> {
     let policy: Policy = toml::from_str(&text)
         .with_context(|| format!("failed to parse policy {}", path.display()))?;
 
-    if policy.paths.repo_roots.is_empty() && policy.paths.file_roots.is_empty() {
-        bail!("policy must declare at least one repo_root or file_root");
+    if policy.paths.repo_roots.is_empty() {
+        bail!("policy must declare at least one repo_root");
     }
     if policy.limits.max_record_bytes == 0
         || policy.limits.max_body_bytes == 0
-        || policy.limits.max_outputs == 0
         || policy.limits.max_control_file_bytes == 0
         || policy.limits.max_control_records == 0
     {
@@ -444,7 +433,9 @@ pub fn run_checked(mut cmd: Command, label: &str) -> Result<Output> {
 pub fn git_output(args: &[&str], label: &str) -> Result<Vec<u8>> {
     let adapter = std::env::var_os("VAULT_GIT_ADAPTER")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py"))
+        })
         .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
     let mut cmd = Command::new(adapter);
     cmd.args(args);
@@ -454,7 +445,9 @@ pub fn git_output(args: &[&str], label: &str) -> Result<Vec<u8>> {
 pub fn git_output_owned(args: &[String], label: &str) -> Result<Vec<u8>> {
     let adapter = std::env::var_os("VAULT_GIT_ADAPTER")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py")))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin/git.py"))
+        })
         .unwrap_or_else(|| PathBuf::from("/nonexistent/git.py"));
     let mut cmd = Command::new(adapter);
     cmd.args(args);
@@ -464,6 +457,9 @@ pub fn git_output_owned(args: &[String], label: &str) -> Result<Vec<u8>> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EffectReceipt {
     pub schema: String,
+    pub submission_id: String,
+    pub call_id: String,
+    pub baggage: Value,
     pub effect_key: String,
     pub kind: String,
     pub target: String,
@@ -485,6 +481,9 @@ pub fn open_effects_db(path: &Path) -> Result<Connection> {
             kind TEXT NOT NULL,
             target TEXT NOT NULL,
             result TEXT NOT NULL,
+            submission_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            baggage_json TEXT NOT NULL,
             applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );",
     )?;
@@ -493,7 +492,7 @@ pub fn open_effects_db(path: &Path) -> Result<Connection> {
 
 pub fn existing_receipt(conn: &Connection, effect_key: &str) -> Result<Option<EffectReceipt>> {
     conn.query_row(
-        "SELECT effect_key, kind, target, result FROM effect_receipts WHERE effect_key = ?1",
+        "SELECT effect_key, kind, target, result, submission_id, call_id, baggage_json FROM effect_receipts WHERE effect_key = ?1",
         params![effect_key],
         |row| {
             Ok(EffectReceipt {
@@ -502,6 +501,8 @@ pub fn existing_receipt(conn: &Connection, effect_key: &str) -> Result<Option<Ef
                 kind: row.get(1)?,
                 target: row.get(2)?,
                 result: row.get(3)?,
+                submission_id:row.get(4)?,call_id:row.get(5)?,
+                baggage:serde_json::from_str(&row.get::<_,String>(6)?).map_err(|error|rusqlite::Error::FromSqlConversionFailure(6,rusqlite::types::Type::Text,Box::new(error)))?,
             })
         },
     )
@@ -515,13 +516,18 @@ pub fn record_receipt(
     kind: &str,
     target: &str,
     result: &str,
+    execution: (&str, &str),
+    baggage: &Value,
 ) -> Result<EffectReceipt> {
     conn.execute(
-        "INSERT INTO effect_receipts(effect_key, kind, target, result) VALUES (?1, ?2, ?3, ?4)",
-        params![effect_key, kind, target, result],
+        "INSERT INTO effect_receipts(effect_key, kind, target, result,submission_id,call_id,baggage_json) VALUES (?1, ?2, ?3, ?4,?5,?6,?7)",
+        params![effect_key, kind, target, result,execution.0,execution.1,serde_json::to_string(baggage)?],
     )?;
     Ok(EffectReceipt {
         schema: RECEIPT_SCHEMA.to_string(),
+        submission_id: execution.0.to_owned(),
+        call_id: execution.1.to_owned(),
+        baggage: baggage.clone(),
         effect_key: effect_key.to_string(),
         kind: kind.to_string(),
         target: target.to_string(),
@@ -576,5 +582,27 @@ mod tests {
     fn rejects_reserved_effect_keys() {
         let value: Value = serde_json::from_str(r#"{"nested":{"effect_key":"x"}}"#).unwrap();
         assert!(reject_reserved_keys(&value).is_err());
+    }
+    #[test]
+    fn receipts_round_trip_opaque_baggage_and_execution_ids() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE effect_receipts(effect_key TEXT PRIMARY KEY,kind TEXT NOT NULL,target TEXT NOT NULL,result TEXT NOT NULL,submission_id TEXT NOT NULL,call_id TEXT NOT NULL,baggage_json TEXT NOT NULL)").unwrap();
+        let baggage = serde_json::json!({"client":{"source":"opaque identity","source_path":"Café 東京.md","nested":[true,null,"  exact "]}});
+        let first = record_receipt(
+            &conn,
+            "eff_test",
+            "repo",
+            "target",
+            "commit",
+            ("00000000-0000-4000-8000-000000000001", "call_test"),
+            &baggage,
+        )
+        .unwrap();
+        let again = existing_receipt(&conn, "eff_test").unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(first).unwrap(),
+            serde_json::to_value(&again).unwrap()
+        );
+        assert_eq!(again.baggage, baggage);
     }
 }

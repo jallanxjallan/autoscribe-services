@@ -534,31 +534,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "srv-export"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "fs2",
- "serde",
- "serde_json",
- "srv-common",
- "tempfile",
-]
-
-[[package]]
-name = "srv-input"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "hex",
- "serde",
- "serde_json",
- "srv-common",
-]
-
-[[package]]
 name = "srv-output"
 version = "0.1.0"
 dependencies = [
