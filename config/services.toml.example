@@ -1,15 +1,8 @@
-# Install as /etc/autoscribe/services.toml.
-# The data pipeline is locked to:
-#   repo post-receive -> same repo/path
-#   dropbox:biznet/incoming/<batch> -> dropbox:biznet/outgoing/<batch>
+# SSH/SCP is the only job transport. This policy authorizes server output effects.
 
 [paths]
-# Bare Git repositories that repo mode may read and write back to.
+# Approved repositories for independently signed output effects.
 repo_roots = ["/home/jeremy/Repos"]
-
-# Retained in the shared policy schema for compatibility. The locked data
-# modes do not use arbitrary filesystem input/output roots.
-file_roots = []
 
 effect_key_file = "/etc/autoscribe/effect.key"
 effects_db = "/var/lib/autoscribe/effects.sqlite"
@@ -18,7 +11,6 @@ control_db = "/home/jeremy/Data/control.sql"
 [limits]
 max_record_bytes = 2097152
 max_body_bytes = 1048576
-max_outputs = 1
 max_control_file_bytes = 262144
 max_control_records = 10000
 

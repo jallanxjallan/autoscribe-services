@@ -7,7 +7,7 @@ use srv_common::{
     sha256_hex, validate_absolute_target, validate_branch_name, validate_relative_path,
     verify_effect_signature, write_ndjson, EFFECT_SCHEMA, RESPONSE_SCHEMA,
 };
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const RETURN_SCHEMA: &str = "autoscribe.return.v1";
 const REPO_OUTPUT_BRANCH: &str = "autoscribe-output";
@@ -23,8 +23,10 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResponseRecord {
     schema: String,
+    submission_id: String,
     call_id: String,
     content: String,
     baggage: Value,
@@ -45,6 +47,8 @@ struct ReturnEnvelope {
 #[derive(Debug, Serialize)]
 struct EffectRecord {
     schema: String,
+    submission_id: String,
+    baggage: Value,
     effect_key: String,
     call_id: String,
     effect_index: usize,
@@ -53,25 +57,6 @@ struct EffectRecord {
     effect: Value,
     content: String,
     content_sha256: String,
-}
-
-fn safe_batch(value: &str) -> Result<()> {
-    safe_identifier(value, "batch", 96)?;
-    if value == "." || value == ".." || value.contains('/') || value.contains(':') {
-        bail!("batch must be a single folder name");
-    }
-    Ok(())
-}
-
-fn safe_dropbox_path(path: &Path) -> Result<()> {
-    validate_relative_path(path)?;
-    let text = path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Dropbox path must be UTF-8"))?;
-    if text.chars().any(char::is_control) || text.contains('\\') {
-        bail!("Dropbox path contains unsafe characters");
-    }
-    Ok(())
 }
 
 fn normalized_effect(route: &Value, policy: &srv_common::Policy) -> Result<Value> {
@@ -104,25 +89,6 @@ fn normalized_effect(route: &Value, policy: &srv_common::Policy) -> Result<Value
                 "path": path,
                 "branch": REPO_OUTPUT_BRANCH,
                 "create_repo": false,
-            }))
-        }
-        Some("dropbox") => {
-            let batch = route
-                .get("batch")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("Dropbox route missing batch"))?;
-            safe_batch(batch)?;
-            let path = PathBuf::from(
-                route
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("Dropbox route missing path"))?,
-            );
-            safe_dropbox_path(&path)?;
-            Ok(json!({
-                "kind": "dropbox",
-                "batch": batch,
-                "path": path,
             }))
         }
         Some(other) => bail!("unsupported trusted return route kind: {other}"),
@@ -181,6 +147,8 @@ fn main() -> Result<()> {
         let content_sha256 = sha256_hex(response.content.as_bytes());
         let mut effect_payload = json!({
             "schema": EFFECT_SCHEMA,
+            "submission_id":response.submission_id,
+            "baggage":response.baggage,
             "call_id": response.call_id,
             "effect_index": 0,
             "effect": effect,
@@ -194,6 +162,11 @@ fn main() -> Result<()> {
 
         write_ndjson(&EffectRecord {
             schema: EFFECT_SCHEMA.to_string(),
+            submission_id: signed_effect["submission_id"]
+                .as_str()
+                .context("Missing submission identity")?
+                .to_owned(),
+            baggage: signed_effect["baggage"].clone(),
             effect_key,
             call_id: signed_effect["call_id"]
                 .as_str()

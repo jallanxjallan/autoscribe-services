@@ -22,8 +22,11 @@ struct Args {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EffectRecord {
     schema: String,
+    submission_id: String,
+    baggage: Value,
     effect_key: String,
     call_id: String,
     effect_index: usize,
@@ -276,6 +279,8 @@ fn main() -> Result<()> {
 
         let mut payload = json!({
             "schema": EFFECT_SCHEMA,
+            "submission_id":record.submission_id,
+            "baggage":record.baggage,
             "call_id": record.call_id.clone(),
             "effect_index": record.effect_index,
             "effect": record.effect.clone(),
@@ -336,7 +341,15 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed applying effect {}", record.effect_key))?;
 
         let target = format!("{}:{}@{}", repo.display(), rel_path.display(), branch);
-        let receipt = record_receipt(&conn, &record.effect_key, "repo", &target, &commit)?;
+        let receipt = record_receipt(
+            &conn,
+            &record.effect_key,
+            "repo",
+            &target,
+            &commit,
+            (&record.submission_id, &record.call_id),
+            &record.baggage,
+        )?;
         write_ndjson(&receipt)
     })
 }

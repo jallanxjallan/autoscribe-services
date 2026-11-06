@@ -2,11 +2,9 @@
 resolver = "2"
 members = [
   "crates/srv-common",
-  "bins/srv-input",
   "bins/srv-output",
   "bins/srv-control-ingest",
   "bins/srv-writeback",
-  "bins/srv-export",
   "bins/srv-plan-select",
   "bins/vault-tools",
 ]
