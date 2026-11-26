@@ -6,7 +6,9 @@ repo_roots = ["/home/jeremy/Repos"]
 
 effect_key_file = "/etc/autoscribe/effect.key"
 effects_db = "/var/lib/autoscribe/effects.sqlite"
-control_db = "/home/jeremy/Data/control.sql"
+control_db = "/var/lib/autoscribe/control.sqlite"
+# Single authoritative runtime ledger setting; no environment fallback.
+ledger_db = "/var/lib/autoscribe/ledger.sqlite"
 
 [limits]
 max_record_bytes = 2097152
